@@ -41,6 +41,8 @@ const SOURCES: &[(&str, &str)] = icons![
     "plus",
     "refresh-cw",
     "search",
+    "square-terminal",
+    "folder-tree",
     "tag",
     "undo-2",
     "x",

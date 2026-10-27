@@ -5,4 +5,5 @@ mod git;
 mod graph;
 mod icons;
 mod repo;
+mod terminal;
 mod theme;

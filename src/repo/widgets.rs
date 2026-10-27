@@ -80,6 +80,20 @@ pub fn section(
     count: usize,
     default_open: bool,
 ) -> bool {
+    section_with_button(ui, id, icon, title, count, default_open, None).0
+}
+
+/// [`section`] with an icon button on the header, left of the count: `(icon, tooltip)`.
+/// Returns (open, button clicked).
+pub fn section_with_button(
+    ui: &mut Ui,
+    id: &str,
+    icon: &str,
+    title: &str,
+    count: usize,
+    default_open: bool,
+    button: Option<(&str, &str)>,
+) -> (bool, bool) {
     let t = Tokens::get(ui.ctx());
     let id = ui.id().with(("section", id));
     let mut open = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(default_open);
@@ -126,7 +140,19 @@ pub fn section(
         theme::medium(11.0),
         t.text_faint,
     );
-    open
+    let mut clicked = false;
+    if let Some((icon, tooltip)) = button {
+        let r = Rect::from_center_size(pos2(rect.right() - 36.0, y), vec2(20.0, 20.0));
+        let b = ui
+            .interact(r, id.with("button"), Sense::click())
+            .on_hover_text(tooltip);
+        if b.hovered() {
+            ui.painter().rect_filled(r, t.radius_sm, t.pressed);
+        }
+        icons::paint(ui, r, icon, 13.0, if b.hovered() { t.text } else { t.icon });
+        clicked = b.clicked();
+    }
+    (open, clicked)
 }
 
 pub fn status_color(t: &Tokens, code: char) -> Color32 {
@@ -305,4 +331,33 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, width: f32) -> Res
         .fill(fill)
         .min_size(vec2(width, 30.0)),
     )
+}
+
+/// A round initials avatar, coloured by name so a person keeps their colour everywhere.
+pub fn avatar(painter: &egui::Painter, center: egui::Pos2, radius: f32, name: &str) {
+    let t = Tokens::get(painter.ctx());
+    painter.circle_filled(center, radius, t.lane(name_hash(name)));
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        initials(name),
+        theme::semibold(radius * 0.8),
+        Color32::WHITE,
+    );
+}
+
+fn initials(name: &str) -> String {
+    let mut parts = name.split_whitespace().filter_map(|w| w.chars().next());
+    let first = parts.next().unwrap_or('?');
+    let last = parts.next_back();
+    let mut s: String = first.to_uppercase().collect();
+    if let Some(l) = last {
+        s.extend(l.to_uppercase());
+    }
+    s
+}
+
+fn name_hash(name: &str) -> usize {
+    name.bytes()
+        .fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
 }

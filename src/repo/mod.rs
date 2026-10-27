@@ -14,9 +14,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use egui::{Key, Ui};
 
-use crate::git::{self, Commit, CommitDetail, InProgress, Refs, StatusFile, WorkStatus};
+use crate::git::{self, Commit, CommitDetail, InProgress, Refs, StatusFile, WorkStatus, Worktree};
 use crate::graph::{self, Graph};
 use crate::icons;
+use crate::terminal::Terminal;
 use crate::theme::Tokens;
 
 pub use dialogs::Dialog;
@@ -42,6 +43,7 @@ struct Loaded {
     refs: Refs,
     history: Vec<Commit>,
     work: WorkStatus,
+    worktrees: Vec<Worktree>,
 }
 
 /// What to re-read after an operation.
@@ -80,6 +82,10 @@ pub(crate) enum Action {
     Dialog(Dialog),
     Commit,
     Fetch,
+    /// Open a folder (a worktree) in its own tab.
+    OpenTab(PathBuf),
+    ToggleTerminal,
+    RestartTerminal,
     Pull,
     Push,
     Reload,
@@ -117,6 +123,12 @@ pub struct RepoTab {
     branch_filter: String,
     /// Jump to the changes row on the next rebuild (after an operation left conflicts).
     focus_wip: bool,
+    worktrees: Vec<Worktree>,
+    terminal: Option<Terminal>,
+    terminal_open: bool,
+    terminal_error: Option<String>,
+    /// A folder the app should open in a new tab (taken by `App`).
+    pub open_request: Option<PathBuf>,
 }
 
 impl RepoTab {
@@ -154,6 +166,11 @@ impl RepoTab {
             status: None,
             branch_filter: String::new(),
             focus_wip: false,
+            worktrees: Vec::new(),
+            terminal: None,
+            terminal_open: false,
+            terminal_error: None,
+            open_request: None,
         };
         tab.reload(ctx);
         tab
@@ -175,10 +192,13 @@ impl RepoTab {
                 let refs = git::refs(&path)?;
                 let history = git::log(&path)?;
                 let work = git::status(&path)?;
+                // Very old gits have no `worktree list`; the section just stays empty.
+                let worktrees = git::worktrees(&path).unwrap_or_default();
                 Ok(Box::new(Loaded {
                     refs,
                     history,
                     work,
+                    worktrees,
                 }))
             })())
         });
@@ -467,6 +487,7 @@ impl RepoTab {
                             self.refs = loaded.refs;
                             self.history = loaded.history;
                             self.work = loaded.work;
+                            self.worktrees = loaded.worktrees;
                             self.rebuild(ctx);
                         }
                         Err(e) => self.load_error = Some(e),
@@ -554,6 +575,17 @@ impl RepoTab {
             Action::Pull => self.run_ops("Pull", ops(&[&["pull", "--ff-only"]]), Refresh::All, ctx),
             Action::Push => self.push(ctx),
             Action::Reload => self.reload(ctx),
+            Action::OpenTab(path) => self.open_request = Some(path),
+            Action::ToggleTerminal => {
+                self.terminal_open = !self.terminal_open;
+                if self.terminal_open && self.terminal.is_none() {
+                    self.start_terminal(ctx);
+                }
+            }
+            Action::RestartTerminal => {
+                self.terminal = None;
+                self.start_terminal(ctx);
+            }
         }
     }
 
@@ -592,6 +624,14 @@ impl RepoTab {
             .size_range(280.0..=900.0)
             .frame(side)
             .show(ui, |ui| self.detail_panel(ui, &mut acts));
+        if self.terminal_open {
+            egui::Panel::bottom("repo_terminal")
+                .resizable(true)
+                .default_size(260.0)
+                .size_range(90.0..=900.0)
+                .frame(egui::Frame::new().fill(t.card))
+                .show(ui, |ui| self.terminal_panel(ui, &mut acts));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.dock))
             .show(ui, |ui| {
@@ -639,6 +679,20 @@ impl RepoTab {
                 .clicked()
             {
                 acts.push(Action::Dialog(Dialog::create_branch(&head, "HEAD")));
+            }
+            let terminal = icons::tool_button(ui, "square-terminal", "Terminal", true)
+                .on_hover_text("Terminal in the repository folder");
+            if self.terminal_open {
+                ui.painter().line_segment(
+                    [
+                        terminal.rect.left_bottom() + egui::vec2(6.0, -1.0),
+                        terminal.rect.right_bottom() + egui::vec2(-6.0, -1.0),
+                    ],
+                    egui::Stroke::new(2.0, t.accent),
+                );
+            }
+            if terminal.clicked() {
+                acts.push(Action::ToggleTerminal);
             }
             widgets::toolbar_separator(ui);
             if icons::tool_button(ui, "refresh-cw", "", !self.loading)
@@ -699,6 +753,57 @@ impl RepoTab {
                 }
             });
         });
+    }
+}
+
+impl RepoTab {
+    fn start_terminal(&mut self, ctx: &egui::Context) {
+        match Terminal::spawn(&self.path, ctx) {
+            Ok(term) => {
+                self.terminal = Some(term);
+                self.terminal_error = None;
+            }
+            Err(e) => self.terminal_error = Some(e),
+        }
+    }
+
+    /// The bottom panel: a header strip and the shell.
+    fn terminal_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        let t = Tokens::get(ui.ctx());
+        let title = match &self.terminal {
+            Some(term) => format!("Terminal · {}", term.shell),
+            None => "Terminal".to_owned(),
+        };
+        widgets::panel_header(ui, &title, |ui| {
+            if icons::small_button(ui, "x", "Close the panel (the shell keeps running)").clicked() {
+                acts.push(Action::ToggleTerminal);
+            }
+            if icons::small_button(ui, "refresh-cw", "Restart the shell").clicked() {
+                acts.push(Action::RestartTerminal);
+            }
+        });
+        if let Some(err) = &self.terminal_error {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.colored_label(t.danger, err);
+            });
+            return;
+        }
+        let Some(term) = &mut self.terminal else {
+            return;
+        };
+        if term.has_exited() {
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("The shell has exited.").color(t.text_dim));
+                if ui.button("Start a new one").clicked() {
+                    acts.push(Action::RestartTerminal);
+                }
+            });
+            return;
+        }
+        term.ui(ui);
     }
 }
 

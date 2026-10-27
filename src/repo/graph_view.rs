@@ -5,6 +5,7 @@ use egui::{
     epaint::CubicBezierShape, pos2, vec2,
 };
 
+use super::widgets;
 use super::{Action, Dialog, Refresh, RepoTab, WIP_HASH, ops};
 use crate::git::Refs;
 use crate::icons;
@@ -15,6 +16,9 @@ const LANE_W: f32 = 16.0;
 const MAX_LANES_SHOWN: usize = 24;
 const AUTHOR_W: f32 = 150.0;
 const DATE_W: f32 = 118.0;
+/// Width of the branch/tag column left of the graph.
+const REFS_W: f32 = 210.0;
+const AVATAR_D: f32 = 20.0;
 
 impl RepoTab {
     pub(super) fn graph_view(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
@@ -74,8 +78,9 @@ impl RepoTab {
             let y = header.center().y;
             let font = theme::semibold(10.5);
             for (x, label) in [
-                (header.left() + 10.0, "GRAPH"),
-                (header.left() + graph_w + 6.0, "DESCRIPTION"),
+                (header.left() + 10.0, "BRANCH / TAG"),
+                (header.left() + REFS_W + 10.0, "GRAPH"),
+                (header.left() + REFS_W + graph_w + 6.0, "DESCRIPTION"),
                 (header.right() - DATE_W - AUTHOR_W, "AUTHOR"),
                 (header.right() - DATE_W, "DATE"),
             ] {
@@ -200,19 +205,75 @@ impl RepoTab {
             painter.rect_filled(rect, 0.0, t.hover);
         }
 
-        // Graph.
+        let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
+        let gx = rect.left() + REFS_W;
+        let x = |lane: usize| gx + 6.0 + lane as f32 * LANE_W + LANE_W / 2.0;
         let row_color = self
             .graph
             .rows
             .get(i)
             .map(|r| t.lane(r.col))
             .unwrap_or(t.text_faint);
+        let node_x = self.graph.rows.get(i).map(|r| x(r.col));
+
+        // Branch and tag pills, left of the graph, joined to the commit's dot.
+        let badges = badges(&commit.refs, &self.refs);
+        let mut resp = resp;
+        if let (Some(first), Some(node_x)) = (badges.first(), node_x) {
+            let refs_clip = Rect::from_min_max(rect.min, pos2(gx - 4.0, bottom));
+            let rp = painter.with_clip_rect(refs_clip);
+            let more = badges.len() - 1;
+            let more_w = if more > 0 { 28.0 } else { 0.0 };
+            let max_w = REFS_W - 10.0 - AVATAR_D - 8.0 - more_w - 8.0;
+            let pill = ref_pill(
+                ui,
+                &rp,
+                pos2(rect.left() + 8.0, mid),
+                first,
+                row_color,
+                max_w,
+            );
+            let mut end = pill.right();
+            if more > 0 {
+                let r = Rect::from_min_size(pos2(end + 3.0, mid - 10.0), vec2(more_w - 3.0, 20.0));
+                rp.rect_filled(
+                    r,
+                    CornerRadius::same(t.radius as u8),
+                    row_color.lerp_to_gamma(Color32::BLACK, 0.35),
+                );
+                rp.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    format!("+{more}"),
+                    theme::medium(10.5),
+                    Color32::WHITE,
+                );
+                end = r.right();
+            }
+            // Avatar of whoever made the tip commit.
+            let avatar = pos2(end + 5.0 + AVATAR_D / 2.0, mid);
+            // Connector to the dot, drawn first so the lanes cross over it.
+            painter.line_segment(
+                [pos2(avatar.x, mid), pos2(node_x, mid)],
+                Stroke::new(1.5, row_color.gamma_multiply(0.8)),
+            );
+            widgets::avatar(&rp, avatar, AVATAR_D / 2.0, &commit.author);
+            let refs_cell = Rect::from_min_max(rect.min, pos2(gx, bottom));
+            if ui.rect_contains_pointer(refs_cell) {
+                let lines: Vec<String> = badges.iter().map(Badge::describe).collect();
+                resp = resp.on_hover_text(format!(
+                    "{}\nTip commit by {}",
+                    lines.join("\n"),
+                    commit.author
+                ));
+            }
+        }
+
+        // Graph.
         if let Some(row) = self.graph.rows.get(i) {
             let gp = painter.with_clip_rect(
-                rect.intersect(Rect::from_min_size(rect.min, vec2(graph_w, ROW_H))),
+                rect.intersect(Rect::from_min_size(pos2(gx, top), vec2(graph_w, ROW_H))),
             );
-            let x = |lane: usize| rect.left() + 6.0 + lane as f32 * LANE_W + LANE_W / 2.0;
-            let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
             let node = pos2(x(row.col), mid);
             let width = 2.0;
 
@@ -250,8 +311,7 @@ impl RepoTab {
             }
         }
 
-        let mid = rect.center().y;
-        let mut x = rect.left() + graph_w + 6.0;
+        let mut x = gx + graph_w + 6.0;
         let text_right = rect.right() - DATE_W - AUTHOR_W - 10.0;
 
         if is_wip {
@@ -281,13 +341,6 @@ impl RepoTab {
             return resp;
         }
 
-        // Ref badges, then the summary.
-        for badge in badges(&commit.refs, &self.refs) {
-            if x > text_right - 40.0 {
-                break;
-            }
-            x += ref_badge(ui, &painter, pos2(x, mid), &badge, row_color, &t) + 4.0;
-        }
         painter
             .with_clip_rect(Rect::from_min_max(
                 pos2(x, rect.top()),
@@ -324,158 +377,224 @@ impl RepoTab {
     }
 }
 
-/// One ref badge in the graph.
+/// One pill in the refs column: a branch (local, remote or both), a tag or a detached HEAD.
+#[derive(Debug)]
 struct Badge {
     label: String,
     kind: BadgeKind,
-    /// The local branch is checked out.
+    /// The branch exists locally.
+    local: bool,
+    /// Remotes that have the branch at this commit.
+    remotes: Vec<String>,
+    /// The checked-out branch (or a detached HEAD).
     head: bool,
-    /// A local branch whose remote counterpart points at the same commit.
-    synced: bool,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum BadgeKind {
-    Local,
-    Remote,
+    Branch,
     Tag,
     DetachedHead,
 }
 
-/// Turns `git log --format=%D` decorations into badges, folding `origin/x` into `x` when both
-/// point at the same commit.
+impl Badge {
+    fn describe(&self) -> String {
+        match self.kind {
+            BadgeKind::Tag => format!("tag {}", self.label),
+            BadgeKind::DetachedHead => "HEAD (detached)".to_owned(),
+            BadgeKind::Branch => {
+                let mut places = Vec::new();
+                if self.local {
+                    places.push(if self.head {
+                        "local, checked out".to_owned()
+                    } else {
+                        "local".to_owned()
+                    });
+                }
+                places.extend(self.remotes.iter().cloned());
+                format!("{} — {}", self.label, places.join(", "))
+            }
+        }
+    }
+}
+
+/// Turns `git log --format=%D` decorations into pills: `x` and `origin/x` at the same commit
+/// become one pill marked local and remote.
 fn badges(decorations: &[String], refs: &Refs) -> Vec<Badge> {
-    let is_remote = |d: &str| {
-        refs.remotes.iter().any(|(remote, _)| {
+    let remote_of = |d: &str| {
+        refs.remotes.iter().find_map(|(remote, _)| {
             d.strip_prefix(remote.as_str())
-                .is_some_and(|r| r.starts_with('/'))
+                .and_then(|r| r.strip_prefix('/'))
+                .map(|branch| (remote.clone(), branch.to_owned()))
         })
     };
-    let mut out = Vec::new();
-    let locals: Vec<&str> = decorations
-        .iter()
-        .filter_map(|d| {
-            let d = d.strip_prefix("HEAD -> ").unwrap_or(d);
-            (!d.starts_with("tag: ") && d != "HEAD" && !is_remote(d)).then_some(d)
-        })
-        .collect();
-    for d in decorations {
-        // `origin/HEAD` only says which branch the remote defaults to.
-        if is_remote(d) && d.ends_with("/HEAD") {
-            continue;
+    fn branch(out: &mut Vec<Badge>, name: &str) -> usize {
+        match out
+            .iter()
+            .position(|b| b.kind == BadgeKind::Branch && b.label == name)
+        {
+            Some(i) => i,
+            None => {
+                out.push(Badge {
+                    label: name.to_owned(),
+                    kind: BadgeKind::Branch,
+                    local: false,
+                    remotes: Vec::new(),
+                    head: false,
+                });
+                out.len() - 1
+            }
         }
-        if let Some(branch) = d.strip_prefix("HEAD -> ") {
-            out.push(Badge {
-                label: branch.to_owned(),
-                kind: BadgeKind::Local,
-                head: true,
-                synced: false,
-            });
+    }
+    let mut out: Vec<Badge> = Vec::new();
+    for d in decorations {
+        if let Some(name) = d.strip_prefix("HEAD -> ") {
+            let i = branch(&mut out, name);
+            if let Some(b) = out.get_mut(i) {
+                b.local = true;
+                b.head = true;
+            }
         } else if d == "HEAD" {
             out.push(Badge {
                 label: "HEAD".to_owned(),
                 kind: BadgeKind::DetachedHead,
+                local: false,
+                remotes: Vec::new(),
                 head: true,
-                synced: false,
             });
         } else if let Some(tag) = d.strip_prefix("tag: ") {
             out.push(Badge {
                 label: tag.to_owned(),
                 kind: BadgeKind::Tag,
+                local: false,
+                remotes: Vec::new(),
                 head: false,
-                synced: false,
             });
-        } else if is_remote(d) {
-            let short = d.split_once('/').map(|(_, b)| b).unwrap_or(d);
-            if !locals.contains(&short) {
-                out.push(Badge {
-                    label: d.clone(),
-                    kind: BadgeKind::Remote,
-                    head: false,
-                    synced: false,
-                });
+        } else if let Some((remote, name)) = remote_of(d) {
+            // `origin/HEAD` only says which branch the remote defaults to.
+            if name == "HEAD" {
+                continue;
+            }
+            let i = branch(&mut out, &name);
+            if let Some(b) = out.get_mut(i) {
+                b.remotes.push(remote);
             }
         } else {
-            out.push(Badge {
-                label: d.clone(),
-                kind: BadgeKind::Local,
-                head: false,
-                synced: false,
-            });
+            let i = branch(&mut out, d);
+            if let Some(b) = out.get_mut(i) {
+                b.local = true;
+            }
         }
     }
-    // Mark locals whose remote twin was folded in.
-    for badge in &mut out {
-        if badge.kind == BadgeKind::Local {
-            badge.synced = decorations.iter().any(|d| {
-                is_remote(d) && d.split_once('/').map(|(_, b)| b) == Some(badge.label.as_str())
-            });
-        }
-    }
-    // Checked-out branch first.
-    out.sort_by_key(|b| !b.head);
+    // Checked out first, then local branches, remote-only ones, tags.
+    out.sort_by_key(|b| match b.kind {
+        _ if b.head => 0,
+        BadgeKind::Branch if b.local => 1,
+        BadgeKind::Branch => 2,
+        BadgeKind::Tag => 3,
+        BadgeKind::DetachedHead => 4,
+    });
     out
 }
 
-/// Paints a badge at `left_center`; returns its width.
-fn ref_badge(
+/// Paints a pill with white text and icons, at most `max_w` wide; returns its rect.
+fn ref_pill(
     ui: &Ui,
     painter: &egui::Painter,
     left_center: Pos2,
     badge: &Badge,
     lane: Color32,
-    t: &Tokens,
-) -> f32 {
-    let (fill, text) = match badge.kind {
-        BadgeKind::Local => (lane, Color32::from_rgb(16, 16, 16)),
-        BadgeKind::Remote => (lane.gamma_multiply(0.25), t.text),
-        BadgeKind::Tag => (t.field, t.text),
-        BadgeKind::DetachedHead => (t.warning, Color32::from_rgb(16, 16, 16)),
+    max_w: f32,
+) -> Rect {
+    const ICON: f32 = 15.0;
+    let t = Tokens::get(ui.ctx());
+    let white = Color32::WHITE;
+    let fill = match badge.kind {
+        BadgeKind::Branch if badge.local => lane,
+        // Only on a remote: a darker shade of the lane.
+        BadgeKind::Branch => lane.lerp_to_gamma(Color32::BLACK, 0.35),
+        BadgeKind::Tag => Color32::from_rgb(104, 104, 112),
+        BadgeKind::DetachedHead => t.warning,
     };
-    let icon = match badge.kind {
-        _ if badge.head => Some("check"),
-        BadgeKind::Tag => Some("tag"),
-        BadgeKind::Remote => Some("cloud"),
-        _ => None,
-    };
-    let font = theme::medium(11.0);
-    let galley = painter.layout_no_wrap(badge.label.clone(), font, text);
-    let icon_w = if icon.is_some() { 14.0 } else { 0.0 };
-    let synced_w = if badge.synced { 16.0 } else { 0.0 };
-    let w = galley.size().x + 12.0 + icon_w + synced_w;
-    let r = Rect::from_min_size(pos2(left_center.x, left_center.y - 9.0), vec2(w, 18.0));
-    painter.rect_filled(r, CornerRadius::same(t.radius as u8), fill);
-    if badge.kind == BadgeKind::Tag {
-        painter.rect_stroke(
-            r,
-            CornerRadius::same(t.radius as u8),
-            Stroke::new(1.0, t.field_border),
-            egui::StrokeKind::Inside,
-        );
+    let mut lead = Vec::new();
+    let mut trail = Vec::new();
+    match badge.kind {
+        BadgeKind::Tag => lead.push("tag"),
+        BadgeKind::DetachedHead => lead.push("check"),
+        BadgeKind::Branch => {
+            if badge.head {
+                lead.push("check");
+            }
+            // Where the branch lives: this computer, a remote, or both.
+            if badge.local {
+                trail.push("laptop");
+            }
+            if !badge.remotes.is_empty() {
+                trail.push("cloud");
+            }
+        }
     }
-    let mut x = r.left() + 6.0;
-    if let Some(icon) = icon {
+    let font = if badge.head {
+        theme::semibold(11.0)
+    } else {
+        theme::medium(11.0)
+    };
+    let icons_w = (lead.len() + trail.len()) as f32 * ICON;
+    let text_room = (max_w - 16.0 - icons_w).max(16.0);
+    let label = truncate(painter, &badge.label, &font, text_room);
+    let galley = painter.layout_no_wrap(label, font, white);
+    let w = (galley.size().x + 16.0 + icons_w).min(max_w);
+    let r = Rect::from_min_size(pos2(left_center.x, left_center.y - 10.0), vec2(w, 20.0));
+    painter.rect_filled(r, CornerRadius::same(t.radius as u8), fill);
+    let mut x = r.left() + 7.0;
+    for icon in lead {
         icons::paint(
             ui,
-            Rect::from_center_size(pos2(x + 5.0, r.center().y), vec2(12.0, 12.0)),
+            Rect::from_center_size(pos2(x + 6.0, r.center().y), vec2(12.0, 12.0)),
             icon,
             11.0,
-            text,
+            white,
         );
-        x += icon_w;
+        x += ICON;
     }
     let gw = galley.size().x;
-    painter.galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, text);
-    if badge.synced {
+    painter.galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, white);
+    x += gw + 1.0;
+    for icon in trail {
         icons::paint(
             ui,
-            Rect::from_center_size(pos2(x + gw + 9.0, r.center().y), vec2(12.0, 12.0)),
-            "cloud",
+            Rect::from_center_size(pos2(x + 8.0, r.center().y), vec2(12.0, 12.0)),
+            icon,
             11.0,
-            text,
+            white,
         );
+        x += ICON;
     }
-    w
+    r
+}
+
+/// `text`, cut with an ellipsis to fit `width`.
+fn truncate(painter: &egui::Painter, text: &str, font: &FontId, width: f32) -> String {
+    let fits = |s: &str| {
+        painter
+            .layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            <= width
+    };
+    if fits(text) {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut n = chars.len();
+    while n > 1 {
+        n -= 1;
+        let s: String = chars.iter().take(n).collect::<String>() + "…";
+        if fits(&s) {
+            return s;
+        }
+    }
+    "…".to_owned()
 }
 
 /// A small rounded count label; returns its width.
@@ -529,8 +648,8 @@ mod tests {
     #[test]
     fn remote_twin_folds_into_local_badge() {
         let decos = [
-            "HEAD -> main",
             "origin/main",
+            "HEAD -> main",
             "origin/HEAD",
             "origin/dev",
             "tag: v1",
@@ -538,14 +657,16 @@ mod tests {
         .map(String::from);
         let b = badges(&decos, &refs_with_origin());
         let labels: Vec<&str> = b.iter().map(|b| b.label.as_str()).collect();
-        assert_eq!(labels, vec!["main", "origin/dev", "v1"]);
-        assert!(b[0].head && b[0].synced);
+        assert_eq!(labels, vec!["main", "dev", "v1"]);
+        assert!(b[0].head && b[0].local && b[0].remotes == ["origin"]);
+        assert!(!b[1].local && b[1].remotes == ["origin"]);
+        assert_eq!(b[2].kind, BadgeKind::Tag);
     }
 
     #[test]
     fn local_branch_with_slash_is_not_remote() {
         let decos = ["feature/x".to_owned()];
         let b = badges(&decos, &refs_with_origin());
-        assert!(b[0].kind == BadgeKind::Local && !b[0].synced);
+        assert!(b[0].kind == BadgeKind::Branch && b[0].local && b[0].remotes.is_empty());
     }
 }

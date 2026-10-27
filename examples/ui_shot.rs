@@ -4,7 +4,7 @@
 //! `cargo run --example ui_shot -- <repo> <out-prefix> [step]...`
 //!
 //! Steps (coordinates in points, window is 1400×860):
-//! `click:x,y`, `rclick:x,y`, `hover:x,y`, `key:Escape`, `type:text`, `wait:ms`, `shot`.
+//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `leave` (pointer off the window), `key:Escape`, `type:text`, `wait:ms`, `shot`.
 //! Each `shot` writes `<out-prefix>-<n>.png`.
 
 use std::time::{Duration, Instant};
@@ -49,6 +49,27 @@ fn main() {
                     });
                 }
                 settle(&mut harness, 400);
+            }
+            "dclick" => {
+                let pos = point(arg);
+                harness.event(Event::PointerMoved(pos));
+                harness.step();
+                for _ in 0..2 {
+                    for pressed in [true, false] {
+                        harness.event(Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        });
+                    }
+                    harness.step();
+                }
+                settle(&mut harness, 600);
+            }
+            "leave" => {
+                harness.remove_cursor();
+                settle(&mut harness, 200);
             }
             "hover" => {
                 harness.event(Event::PointerMoved(point(arg)));

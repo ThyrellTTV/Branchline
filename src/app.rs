@@ -606,7 +606,8 @@ impl eframe::App for App {
         self.poll_clone(&ctx);
 
         // Shortcuts.
-        let modal_open = self.clone_form.is_some();
+        // A focused text field or the terminal keeps these keys for itself.
+        let modal_open = self.clone_form.is_some() || ctx.egui_wants_keyboard_input();
         let (new_tab, close, refresh, focused) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::T),
@@ -625,7 +626,7 @@ impl eframe::App for App {
         let regained = focused && !self.was_focused;
         self.was_focused = focused;
         if let Some(Tab::Repo(r)) = self.tabs.get_mut(self.active)
-            && (refresh || regained)
+            && ((refresh && !modal_open) || regained)
         {
             r.reload(&ctx);
         }
@@ -654,7 +655,13 @@ impl eframe::App for App {
 
         let active = self.active;
         match self.tabs.get_mut(active) {
-            Some(Tab::Repo(repo)) => repo.ui(ui),
+            Some(Tab::Repo(repo)) => {
+                repo.ui(ui);
+                // A worktree asked to be opened in its own tab.
+                if let Some(path) = repo.open_request.take() {
+                    self.open_repo(&path, &ctx);
+                }
+            }
             _ => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(t.dock))

@@ -71,15 +71,7 @@ impl RepoTab {
                         ui.horizontal(|ui| {
                             let (rect, _) =
                                 ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
-                            let color = t.lane(name_hash(&detail.author));
-                            ui.painter().circle_filled(rect.center(), 16.0, color);
-                            ui.painter().text(
-                                rect.center(),
-                                Align2::CENTER_CENTER,
-                                initials(&detail.author),
-                                theme::semibold(12.5),
-                                egui::Color32::from_rgb(16, 16, 16),
-                            );
+                            widgets::avatar(ui.painter(), rect.center(), 16.0, &detail.author);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.label(RichText::new(&detail.author).font(theme::medium(12.5)))
@@ -370,7 +362,7 @@ impl RepoTab {
                 .desired_width(f32::INFINITY)
                 .margin(egui::Margin::symmetric(8, 6)),
         );
-        ui.add(
+        let body = ui.add(
             egui::TextEdit::multiline(&mut self.commit_body)
                 .hint_text("Description (optional)")
                 .desired_width(f32::INFINITY)
@@ -393,7 +385,8 @@ impl RepoTab {
             "Stage all and commit".to_owned()
         };
         let can = idle && !self.commit_summary.trim().is_empty() && self.work.conflicted.is_empty();
-        let shortcut = (summary.has_focus() || ui.ctx().egui_wants_keyboard_input())
+        // Only from the message fields, so Ctrl+Enter in the terminal stays the shell's.
+        let shortcut = (summary.has_focus() || body.has_focus())
             && ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter));
         let resp = widgets::primary_button(ui, &label, can, ui.available_width());
         if (resp.clicked() || (shortcut && can)) && can {
@@ -497,20 +490,4 @@ fn empty_hint(ui: &mut Ui, text: &str) {
         egui::FontId::proportional(11.5),
         t.text_faint,
     );
-}
-
-fn initials(name: &str) -> String {
-    let mut parts = name.split_whitespace().filter_map(|w| w.chars().next());
-    let first = parts.next().unwrap_or('?');
-    let last = parts.next_back();
-    let mut s: String = first.to_uppercase().collect();
-    if let Some(l) = last {
-        s.extend(l.to_uppercase());
-    }
-    s
-}
-
-fn name_hash(name: &str) -> usize {
-    name.bytes()
-        .fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
 }
