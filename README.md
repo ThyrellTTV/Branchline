@@ -5,44 +5,74 @@ Rust + [egui/eframe](https://github.com/emilk/egui), the same stack and look as 
 PhotoCraft, so it builds on Windows, Linux and macOS. It drives the installed `git` command line,
 so your config, credentials and hooks apply as usual.
 
-![gitcraft: branches and worktrees on the left, the graph with branch pills, uncommitted changes on the right and the integrated terminal below](docs/screenshot.png)
+![gitcraft: branches, remotes and worktrees on the left, the graph with branch pills and relative dates, uncommitted changes on the right and the integrated terminal below](docs/screenshot.png)
 
 ## Features
 
-- **Start page**: checks that `git` is installed; open an existing repository, create one
-  (`git init`) or clone one; recent repositories.
-- **Tabs** like a browser, one per repository. `+` / Ctrl+T opens a start page, Ctrl+W closes,
-  middle-click closes. Open tabs, recents and the theme are remembered.
-- **Branches** (left): local branches with ahead/behind counts, remote branches per remote, tags,
-  a filter. Click jumps to the commit; double-click checks out. Right-click: check out, merge into
-  the current branch, create a branch, copy the name, delete (with force option), delete from the
-  remote, delete a tag.
-- **Worktrees** (left): every worktree with its branch, marked main / locked / missing. Add one
-  (on an existing or a new branch) with `+`, double-click or *Open in a tab* to work in it,
-  lock/unlock, remove (with force), prune missing ones. A branch checked out in another worktree
-  shows a worktree icon, and double-clicking it opens that worktree. *Check out in a new
-  worktree…* on a branch's menu.
-- **Graph** (centre): every branch, coloured lanes, up to 5000 commits, ↑/↓ to move. Branch and
-  tag pills sit in their own column left of the graph, joined to their commit: white text, a
-  laptop icon when the branch is local, a cloud when a remote has it at that commit (`x` and
-  `origin/x` together make one pill), the tip author's avatar, `+N` when more refs share the
-  commit (hover lists them). An *Uncommitted changes*
-  row sits on top when the working tree is dirty. Right-click a commit: create a branch, check it
-  out (detached), cherry-pick, revert, copy hash or message.
-- **Detail** (right): commit message, author, parents (clickable), changed files with +/−.
-  On the changes row: conflicted / unstaged / staged lists with stage, unstage, discard and
-  mark-resolved buttons on hover, *Stage all* / *Unstage all*, and the commit box
-  (Ctrl+Enter; with nothing staged it stages everything).
-- **Diff**: clicking a file shows its diff in the centre with old/new line numbers (Esc closes).
-- **Merges and conflicts**: a merge, cherry-pick or revert that stops on conflicts shows a banner
-  with *Abort*; the prepared merge message fills the commit box.
-- **Toolbar**: Fetch (`--all --prune`), Pull (`--ff-only`), Push (publishes a new branch with
-  `-u`), new branch, terminal, refresh (F5; also when the window regains focus).
-- **Terminal**: the *Terminal* button opens your shell (PowerShell on Windows, `$SHELL` elsewhere)
-  in the repository folder, in a resizable panel under the graph. It runs in a real
-  pseudo-terminal (ConPTY on Windows), with colours, scrollback (mouse wheel) and keys such as
-  Ctrl+C, arrows and Tab going to the shell. Closing the panel keeps the shell running.
-- **Themes**: Dark, Medium Gray and Light, from PhotoCraft's Pro palettes.
+**Repositories and tabs**
+- Start page: checks that `git` is installed; open, create (`git init`) or clone a repository;
+  recent repositories.
+- Browser-like tabs, one per repository (Ctrl+T, Ctrl+W, middle-click). Open tabs, recents,
+  theme and settings are remembered.
+- Changes made elsewhere (editor, terminal) show up by themselves: the folder is watched.
+
+**Graph**
+- Every branch, coloured lanes, ↑/↓ to move. History loads 1500 commits at a time as you scroll.
+- Branch and tag pills in their own column left of the graph, on each branch's tip only, joined
+  to their commit: white text, a laptop icon when the branch is local, a cloud when a remote has
+  it at that commit (`x` and `origin/x` make one pill), a pull-request icon when one is open,
+  `+N` when more refs share the commit, the author's avatar and how long ago it was ("2 hours
+  ago"). Author, date and hash columns are optional (Settings).
+- An *Uncommitted changes* row on top while the working tree is dirty.
+- Search (Ctrl+F) through messages, authors and hashes of all history; Enter / Shift+Enter jump
+  between results, loading older history when needed.
+- Right-click a commit: create a branch or a tag, check it out, cherry-pick, revert, reset the
+  current branch to it (soft / mixed / hard, confirmed), the menu of each branch on it.
+
+**Branches, remotes, worktrees, stashes, tags** (left)
+- Local branches with ahead/behind; right-click: check out (or in a new worktree), merge into /
+  rebase onto the current branch, push, create a pull request, rename, delete…
+- Remotes: add, edit (name and URL), fetch one, remove; their branches below each.
+- Worktrees: add (existing or new branch), open in a tab, open a terminal there, lock, remove,
+  prune.
+- Stashes: stash (with a message, untracked files included), see what a stash holds, apply, pop,
+  drop.
+- Pull / merge requests of GitHub (through `gh`) or GitLab (through `glab`): list, open in the
+  browser, check out, create from a branch.
+- Tags: create (light or annotated, optionally pushed), push, delete locally or on the remote.
+
+**Changes and commits** (right)
+- Conflicted / unstaged / staged lists with stage, unstage, discard and mark-resolved buttons,
+  *Stage all* / *Unstage all*; right-click a file to open it, open it in your editor or show it in
+  its folder.
+- Commit box (Ctrl+Enter; with nothing staged it stages everything), *Amend last commit*
+  (warns when the commit is already pushed), the identity you commit as, and saved identities to
+  switch a repository to.
+- Undo / redo (Ctrl+Z / Ctrl+Y) of commits, amends, merges, rebases, pulls, resets,
+  cherry-picks, reverts, checkouts, branch create / rename / delete, tags and stashes.
+
+**Diffs and conflicts** (centre)
+- Unified or side by side, syntax colours, the changed part of each line marked, whitespace
+  changes optional, images shown before / after. Esc closes.
+- Conflicts open in a three-pane editor: each conflict's two sides with *Ours*, *Theirs* and
+  *Both* buttons, and the result below (editable). *Use mine* / *Use theirs* for a whole file.
+- A merge, rebase, cherry-pick or revert stopped on conflicts shows a banner with *Abort*; the
+  commit box finishes it (*Continue rebase* during a rebase).
+
+**Toolbar, terminal, app**
+- Undo, redo, Fetch, Pull and Push (with incoming / outgoing counts), new branch, stash, terminal,
+  search, open the folder (Explorer / Finder, your editor), refresh (F5).
+- Background fetch every few minutes (Settings; 0 turns it off).
+- Terminal panel with tabs: PowerShell, cmd, Git Bash, WSL… on Windows, your shells elsewhere, in a
+  real pseudo-terminal (ConPTY on Windows) with colours, scrollback, mouse selection and copy
+  (Ctrl+C with a selection, Ctrl+Shift+C or right-click).
+- Command palette (Ctrl+P): every action and branch, fuzzy matched.
+- Settings: zoom, branch column width, graph columns, avatars from Gravatar / GitHub (sends a hash
+  of each author's email; can be turned off), notifications, background fetch, editor command,
+  default shell and terminal font size, saved identities.
+- Toasts, and a desktop notification when a long operation ends while the window is in the
+  background.
+- Themes: Dark, Medium Gray and Light, from PhotoCraft's Pro palettes.
 
 ## Build and run
 
@@ -53,7 +83,8 @@ cargo test
 ```
 
 Linux needs the usual eframe system packages (e.g. `libxkbcommon-dev`, `libgtk-3-dev` for the
-file dialogs).
+file dialogs, `libdbus-1-dev` for notifications). Pull requests need the GitHub CLI (`gh`) or
+GitLab CLI (`glab`), logged in.
 
 ### Looking at the UI headlessly
 
@@ -63,25 +94,31 @@ file dialogs).
 cargo run --example ui_shot -- path/to/repo /tmp/shot click:500,266 shot key:Escape shot
 ```
 
-Steps: `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `leave`, `key:Name`, `type:text`,
-`wait:ms`, `shot`. The README screenshot was made this way, on a demo repository.
+Steps: `click:x,y`, `dclick:x,y`, `rclick:x,y`, `drag:x1,y1,x2,y2`, `hover:x,y`, `leave`,
+`key:Name`, `ckey:Name` (with Ctrl / Cmd), `type:text`, `wait:ms`, `shot`. The README screenshot
+was made this way, on a demo repository.
 
 ## Layout
 
 | File | Job |
 |---|---|
-| `src/git.rs` | `git` CLI wrapper and output parsing (refs, log, status, diffs) |
+| `src/git.rs` | `git` CLI wrapper and output parsing (refs, log, status, stashes, remotes, search) |
 | `src/graph.rs` | lane layout for the commit graph |
+| `src/forge.rs` | pull / merge requests through `gh` and `glab` |
+| `src/avatars.rs` | avatars from Gravatar / GitHub, cached on disk |
+| `src/settings.rs` | user settings and their form |
 | `src/theme.rs` | colour tokens, fonts, egui style (PhotoCraft's Pro themes) |
 | `src/icons.rs` | embedded Lucide SVG icons, tinted |
-| `src/repo/mod.rs` | one repository tab: state, background git work, toolbar |
-| `src/repo/sidebar.rs` | branches, worktrees and tags pane |
-| `src/repo/graph_view.rs` | commit graph and the branch/tag pills |
-| `src/repo/detail.rs` | commit detail, changes and commit box |
-| `src/repo/diff.rs` | diff parsing and the diff view |
-| `src/repo/dialogs.rs` | create-branch, add-worktree and confirmation dialogs |
-| `src/repo/widgets.rs` | shared painted widgets (panel headers, file rows, chips) |
-| `src/terminal.rs` | integrated terminal: pty, VT parsing (`vt100`), painting, keys |
-| `src/app.rs` | window shell: git check, tabs, start page, cloning, persistence |
+| `src/terminal.rs` | integrated terminal: pty, VT parsing (`vt100`), painting, keys, selection |
+| `src/repo/mod.rs` | one repository tab: state, background git work, undo / redo, toolbar |
+| `src/repo/sidebar.rs` | branches, remotes, worktrees, stashes, pull requests, tags |
+| `src/repo/graph_view.rs` | commit graph, pills, search bar, commit menu |
+| `src/repo/detail.rs` | commit / stash detail, changes and commit box |
+| `src/repo/diff.rs` | diff loading, pairing and the diff view (unified, split, images) |
+| `src/repo/highlight.rs` | syntax colours (syntect) |
+| `src/repo/conflict.rs` | three-pane conflict editor |
+| `src/repo/dialogs.rs` | branch, tag, stash, remote, worktree, pull request and confirm dialogs |
+| `src/repo/widgets.rs` | shared painted widgets (panel headers, file rows, avatars, tabs) |
+| `src/app.rs` | window shell: tabs, start page, cloning, palette, settings, toasts |
 
 Assets and their licences: [ATTRIBUTION.md](ATTRIBUTION.md).

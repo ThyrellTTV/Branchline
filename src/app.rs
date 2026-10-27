@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::git;
 use crate::icons;
 use crate::repo::RepoTab;
+use crate::settings::Settings;
 use crate::theme::{self, ThemeKind, Tokens};
 
 const MAX_RECENT: usize = 12;
@@ -23,6 +24,7 @@ struct Saved {
     recent: Vec<PathBuf>,
     theme: ThemeKind,
     clone_parent: Option<PathBuf>,
+    settings: Settings,
 }
 
 enum Tab {
@@ -53,6 +55,39 @@ pub struct App {
     clone_form: Option<CloneForm>,
     /// A clone running in the background: (destination, result).
     cloning: Option<(PathBuf, Receiver<Result<(), String>>)>,
+    settings: Settings,
+    settings_open: bool,
+    palette: Option<Palette>,
+    toasts: Vec<Toast>,
+}
+
+/// The command palette (Ctrl+P): type to filter, Enter runs.
+struct Palette {
+    query: String,
+    selected: usize,
+    focus: bool,
+}
+
+struct Toast {
+    text: String,
+    error: bool,
+    until: std::time::Instant,
+}
+
+/// What a palette entry does outside the open repository.
+enum AppCommand {
+    NewTab,
+    Open,
+    Create,
+    Clone,
+    Settings,
+    Theme(ThemeKind),
+}
+
+enum Entry {
+    App(AppCommand),
+    /// Index into the active repository's palette items.
+    Repo(usize),
 }
 
 impl App {
@@ -66,6 +101,7 @@ impl App {
         egui_extras::install_image_loaders(ctx);
         theme::install_fonts(ctx);
         theme::apply(ctx, saved.theme);
+        saved.settings.set(ctx);
 
         let mut app = Self {
             git_version: git::version(),
@@ -74,6 +110,10 @@ impl App {
             recent: saved.recent,
             theme: saved.theme,
             clone_parent: saved.clone_parent,
+            settings: saved.settings.clone(),
+            settings_open: false,
+            palette: None,
+            toasts: Vec::new(),
             error: None,
             was_focused: true,
             clone_form: None,
@@ -316,6 +356,12 @@ impl App {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(6.0);
+                if icons::small_button(ui, "settings", "Settings").clicked() {
+                    self.settings_open = true;
+                }
+                if icons::small_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
+                    self.open_palette();
+                }
                 let resp = icons::small_button(ui, "palette", "Theme");
                 egui::Popup::menu(&resp).show(|ui| {
                     ui.label(
@@ -607,15 +653,26 @@ impl eframe::App for App {
 
         // Shortcuts.
         // A focused text field or the terminal keeps these keys for itself.
-        let modal_open = self.clone_form.is_some() || ctx.egui_wants_keyboard_input();
-        let (new_tab, close, refresh, focused) = ctx.input(|i| {
+        let modal_open = self.clone_form.is_some()
+            || self.palette.is_some()
+            || self.settings_open
+            || ctx.egui_wants_keyboard_input();
+        let (new_tab, close, refresh, focused, palette) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::T),
                 i.modifiers.command && i.key_pressed(Key::W),
                 i.key_pressed(Key::F5),
                 i.focused,
+                i.modifiers.command && i.key_pressed(Key::P),
             )
         });
+        if palette && self.clone_form.is_none() && !self.settings_open {
+            if self.palette.is_some() {
+                self.palette = None;
+            } else {
+                self.open_palette();
+            }
+        }
         if new_tab && !modal_open {
             self.new_tab();
         }
@@ -656,6 +713,8 @@ impl eframe::App for App {
         let active = self.active;
         match self.tabs.get_mut(active) {
             Some(Tab::Repo(repo)) => {
+                repo.keys_blocked =
+                    self.palette.is_some() || self.settings_open || self.clone_form.is_some();
                 repo.ui(ui);
                 // A worktree asked to be opened in its own tab.
                 if let Some(path) = repo.open_request.take() {
@@ -669,6 +728,25 @@ impl eframe::App for App {
             }
         }
         self.clone_dialog(&ctx);
+        self.palette_ui(&ctx);
+        self.settings_ui(&ctx);
+
+        // Long operations that ended: a toast, and a desktop notification when away.
+        for tab in &mut self.tabs {
+            if let Tab::Repo(r) = tab
+                && let Some((text, error)) = r.finished.take()
+            {
+                if !focused && self.settings.notifications {
+                    notify(&text);
+                }
+                self.toasts.push(Toast {
+                    text,
+                    error,
+                    until: std::time::Instant::now() + std::time::Duration::from_secs(6),
+                });
+            }
+        }
+        self.toasts_ui(&ctx);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -694,6 +772,7 @@ impl eframe::App for App {
             recent: self.recent.clone(),
             theme: self.theme,
             clone_parent: self.clone_parent.clone(),
+            settings: self.settings.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &saved);
     }
@@ -821,5 +900,308 @@ fn strip_verbatim(path: PathBuf) -> PathBuf {
     match s.strip_prefix(r"\\?\") {
         Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
         _ => path,
+    }
+}
+
+impl App {
+    fn open_palette(&mut self) {
+        self.palette = Some(Palette {
+            query: String::new(),
+            selected: 0,
+            focus: true,
+        });
+    }
+
+    /// Every palette entry: (label, hint, what it runs).
+    fn palette_entries(&self) -> Vec<(String, String, Entry)> {
+        let mut list = vec![
+            (
+                "New tab".to_owned(),
+                "Ctrl+T".to_owned(),
+                Entry::App(AppCommand::NewTab),
+            ),
+            (
+                "Open repository…".to_owned(),
+                "app".to_owned(),
+                Entry::App(AppCommand::Open),
+            ),
+            (
+                "Create repository…".to_owned(),
+                "app".to_owned(),
+                Entry::App(AppCommand::Create),
+            ),
+            (
+                "Clone repository…".to_owned(),
+                "app".to_owned(),
+                Entry::App(AppCommand::Clone),
+            ),
+            (
+                "Settings".to_owned(),
+                "app".to_owned(),
+                Entry::App(AppCommand::Settings),
+            ),
+        ];
+        for kind in ThemeKind::ALL {
+            list.push((
+                format!("Theme: {}", kind.label()),
+                "theme".to_owned(),
+                Entry::App(AppCommand::Theme(kind)),
+            ));
+        }
+        if let Some(Tab::Repo(repo)) = self.tabs.get(self.active) {
+            for (i, (label, hint, _)) in repo.palette_items().into_iter().enumerate() {
+                list.push((label, hint, Entry::Repo(i)));
+            }
+        }
+        list
+    }
+
+    fn run_entry(&mut self, entry: Entry, ctx: &egui::Context) {
+        match entry {
+            Entry::App(AppCommand::NewTab) => self.new_tab(),
+            Entry::App(AppCommand::Open) => self.pick_existing(ctx),
+            Entry::App(AppCommand::Create) => self.pick_new(ctx),
+            Entry::App(AppCommand::Clone) => self.start_clone(),
+            Entry::App(AppCommand::Settings) => self.settings_open = true,
+            Entry::App(AppCommand::Theme(kind)) => self.set_theme(ctx, kind),
+            Entry::Repo(i) => {
+                if let Some(Tab::Repo(repo)) = self.tabs.get_mut(self.active)
+                    && let Some((_, _, action)) = repo.palette_items().into_iter().nth(i)
+                {
+                    repo.queue(action);
+                    ctx.request_repaint();
+                }
+            }
+        }
+    }
+
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        if self.palette.is_none() {
+            return;
+        }
+        let t = Tokens::get(ctx);
+        let entries = self.palette_entries();
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
+        let query = palette.query.to_lowercase();
+        let shown: Vec<usize> = (0..entries.len())
+            .filter(|&i| fuzzy(&entries[i].0.to_lowercase(), &query))
+            .take(60)
+            .collect();
+        palette.selected = palette.selected.min(shown.len().saturating_sub(1));
+        let (up, down, enter, esc) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if down {
+            palette.selected = (palette.selected + 1).min(shown.len().saturating_sub(1));
+        }
+        if up {
+            palette.selected = palette.selected.saturating_sub(1);
+        }
+        let mut run = None;
+        let mut close = esc;
+        let frame = egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, t.field_border))
+            .corner_radius(t.radius_lg)
+            .inner_margin(egui::Margin::same(10))
+            .shadow(ctx.global_style().visuals.window_shadow);
+        let area = egui::Area::new(egui::Id::new("palette"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, vec2(0.0, 70.0));
+        let resp = area.show(ctx, |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(560.0);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut palette.query)
+                        .hint_text("Type a command or a branch…")
+                        .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(10, 8))
+                        .font(theme::medium(14.0)),
+                );
+                if std::mem::take(&mut palette.focus) {
+                    edit.request_focus();
+                }
+                if edit.changed() {
+                    palette.selected = 0;
+                }
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for (k, &i) in shown.iter().enumerate() {
+                            let (label, hint, _) = &entries[i];
+                            let (rect, r) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 28.0),
+                                Sense::click(),
+                            );
+                            if k == palette.selected {
+                                ui.painter().rect_filled(rect, t.radius_sm, t.row_selected);
+                                if up || down {
+                                    ui.scroll_to_rect(rect, None);
+                                }
+                            } else if r.hovered() {
+                                ui.painter().rect_filled(rect, t.radius_sm, t.hover);
+                            }
+                            ui.painter().text(
+                                pos2(rect.left() + 10.0, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(13.0),
+                                t.text,
+                            );
+                            ui.painter().text(
+                                pos2(rect.right() - 10.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                hint,
+                                egui::FontId::proportional(11.0),
+                                t.text_faint,
+                            );
+                            if r.clicked() {
+                                run = Some(i);
+                            }
+                        }
+                        if shown.is_empty() {
+                            ui.label(RichText::new("Nothing matches").color(t.text_faint));
+                        }
+                    });
+            });
+        });
+        if enter && let Some(&i) = shown.get(palette.selected) {
+            run = Some(i);
+        }
+        if resp.response.clicked_elsewhere()
+            && ctx.input(|i| i.pointer.any_pressed())
+            && run.is_none()
+        {
+            close = true;
+        }
+        if close || run.is_some() {
+            self.palette = None;
+        }
+        if let Some(i) = run
+            && let Some((_, _, entry)) = entries.into_iter().nth(i)
+        {
+            self.run_entry(entry, ctx);
+        }
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let t = Tokens::get(ctx);
+        let frame = egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, t.field_border))
+            .corner_radius(t.radius_lg)
+            .inner_margin(egui::Margin::same(18))
+            .shadow(ctx.global_style().visuals.window_shadow);
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::new("settings"))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(110))
+            .show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Settings").font(theme::semibold(16.0)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::small_button(ui, "x", "Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(560.0)
+                    .show(ui, |ui| {
+                        if self.settings.ui(ui) {
+                            self.settings.set(ui.ctx());
+                        }
+                    });
+            });
+        if close || resp.should_close() {
+            self.settings_open = false;
+        }
+    }
+
+    fn toasts_ui(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        if self.toasts.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        let t = Tokens::get(ctx);
+        egui::Area::new(egui::Id::new("toasts"))
+            .order(egui::Order::Tooltip)
+            .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-16.0, -16.0))
+            .show(ctx, |ui| {
+                for toast in &self.toasts {
+                    egui::Frame::new()
+                        .fill(t.card)
+                        .stroke(Stroke::new(
+                            1.0,
+                            if toast.error { t.danger } else { t.success },
+                        ))
+                        .corner_radius(t.radius_lg)
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .shadow(ctx.global_style().visuals.popup_shadow)
+                        .show(ui, |ui| {
+                            ui.set_max_width(380.0);
+                            ui.horizontal(|ui| {
+                                let icon = if toast.error { "circle-alert" } else { "check" };
+                                icons::inline(
+                                    ui,
+                                    icon,
+                                    16.0,
+                                    if toast.error { t.danger } else { t.success },
+                                );
+                                ui.add(egui::Label::new(&toast.text).wrap());
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+            });
+    }
+}
+
+/// `needle`'s characters appear in `haystack` in order ("cmain" → "Check out main").
+fn fuzzy(haystack: &str, needle: &str) -> bool {
+    let mut chars = haystack.chars();
+    needle
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .all(|n| chars.any(|h| h == n))
+}
+
+/// A desktop notification, on its own thread (it can take a moment to show).
+fn notify(text: &str) {
+    let text = text.to_owned();
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("gitcraft")
+            .summary("gitcraft")
+            .body(&text)
+            .show();
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fuzzy;
+
+    #[test]
+    fn fuzzy_matching() {
+        assert!(fuzzy("check out main", "cmain"));
+        assert!(fuzzy("check out main", "co main"));
+        assert!(!fuzzy("fetch", "push"));
+        assert!(fuzzy("anything", ""));
     }
 }

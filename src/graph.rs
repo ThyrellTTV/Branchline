@@ -100,6 +100,7 @@ mod tests {
             date: String::new(),
             summary: String::new(),
             refs: Vec::new(),
+            ..Commit::default()
         }
     }
 

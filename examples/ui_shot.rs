@@ -4,7 +4,7 @@
 //! `cargo run --example ui_shot -- <repo> <out-prefix> [step]...`
 //!
 //! Steps (coordinates in points, window is 1400×860):
-//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `leave` (pointer off the window), `key:Escape`, `type:text`, `wait:ms`, `shot`.
+//! `click:x,y`, `dclick:x,y`, `rclick:x,y`, `hover:x,y`, `drag:x1,y1,x2,y2`, `leave` (pointer off the window), `key:Escape`, `ckey:P` (Ctrl/Cmd+key), `type:text`, `wait:ms`, `shot`.
 //! Each `shot` writes `<out-prefix>-<n>.png`.
 
 use std::time::{Duration, Instant};
@@ -71,6 +71,36 @@ fn main() {
                 harness.remove_cursor();
                 settle(&mut harness, 200);
             }
+            "drag" => {
+                let n: Vec<f32> = arg
+                    .split(',')
+                    .map(|v| v.trim().parse().unwrap_or(0.0))
+                    .collect();
+                let (from, to) = match n[..] {
+                    [a, b, c, d] => (Pos2::new(a, b), Pos2::new(c, d)),
+                    _ => (Pos2::ZERO, Pos2::ZERO),
+                };
+                harness.event(Event::PointerMoved(from));
+                harness.step();
+                harness.event(Event::PointerButton {
+                    pos: from,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                });
+                harness.step();
+                for k in 1..=8 {
+                    harness.event(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+                    harness.step();
+                }
+                harness.event(Event::PointerButton {
+                    pos: to,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Modifiers::NONE,
+                });
+                settle(&mut harness, 300);
+            }
             "hover" => {
                 harness.event(Event::PointerMoved(point(arg)));
                 settle(&mut harness, 200);
@@ -80,6 +110,12 @@ fn main() {
                     harness.key_press(key);
                 }
                 settle(&mut harness, 200);
+            }
+            "ckey" => {
+                if let Some(key) = Key::from_name(arg) {
+                    harness.key_press_modifiers(Modifiers::COMMAND, key);
+                }
+                settle(&mut harness, 300);
             }
             "type" => {
                 harness.event(Event::Text(arg.to_owned()));

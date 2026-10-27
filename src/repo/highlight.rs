@@ -1,0 +1,89 @@
+//! Syntax colouring for diffs (syntect, pure-Rust regex engine), chosen by file extension.
+
+use std::sync::OnceLock;
+
+use egui::Color32;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
+/// Coloured pieces of one line.
+pub type Spans = Vec<(Color32, String)>;
+
+/// Bigger diffs stay uncoloured: highlighting is the slow part of opening them.
+const MAX_LINES: usize = 8000;
+
+fn syntaxes() -> &'static SyntaxSet {
+    static SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn themes() -> &'static ThemeSet {
+    static SET: OnceLock<ThemeSet> = OnceLock::new();
+    SET.get_or_init(ThemeSet::load_defaults)
+}
+
+/// Colours `lines` (one file's text, in order) for `path`; `None` for plain text, unknown
+/// types or very long inputs.
+pub fn highlight<'a>(
+    path: &str,
+    lines: impl ExactSizeIterator<Item = &'a str>,
+    dark: bool,
+) -> Option<Vec<Spans>> {
+    if lines.len() > MAX_LINES {
+        return None;
+    }
+    let ss = syntaxes();
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())?;
+    let syntax = ss.find_syntax_by_extension(&ext)?;
+    if syntax.name == "Plain Text" {
+        return None;
+    }
+    let theme_name = if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    };
+    let theme = themes().themes.get(theme_name)?;
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut out = Vec::new();
+    for line in lines {
+        let with_nl = format!("{line}\n");
+        let ranges = h.highlight_line(&with_nl, ss).ok()?;
+        out.push(
+            ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    let c = style.foreground;
+                    (
+                        Color32::from_rgb(c.r, c.g, c.b),
+                        text.trim_end_matches('\n').to_owned(),
+                    )
+                })
+                .filter(|(_, t)| !t.is_empty())
+                .collect(),
+        );
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colours_rust_and_skips_plain_text() {
+        let lines = ["fn main() {", "    let x = 1;", "}"];
+        let spans = highlight("a.rs", lines.iter().copied(), true);
+        let spans = spans.unwrap_or_default();
+        assert_eq!(spans.len(), 3);
+        let text: String = spans[1].iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(text, "    let x = 1;");
+        // More than one colour on a line of code.
+        assert!(spans[0].len() > 1);
+        assert!(highlight("notes.txt", lines.iter().copied(), true).is_none());
+        assert!(highlight("Makefile-without-ext", lines.iter().copied(), true).is_none());
+    }
+}

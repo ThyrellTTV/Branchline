@@ -25,7 +25,43 @@ impl RepoTab {
 
     fn commit_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
-        widgets::panel_header(ui, "Commit", |_| {});
+        let idle = self.busy_op.is_none();
+        let stash = self.stash_view.and_then(|i| self.stashes.get(i)).cloned();
+        let title = if stash.is_some() { "Stash" } else { "Commit" };
+        widgets::panel_header(ui, title, |ui| {
+            if let Some(stash) = &stash {
+                let more = icons::small_button(ui, "chevron-down", "Apply, pop or drop");
+                egui::Popup::menu(&more).show(|ui| {
+                    super::sidebar::stash_menu_items(ui, acts, &stash.name, idle);
+                });
+            }
+        });
+        if let Some(stash) = &stash {
+            egui::Frame::new()
+                .fill(t.accent.gamma_multiply(0.10))
+                .inner_margin(egui::Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        icons::inline(ui, "archive", 15.0, t.accent);
+                        ui.label(RichText::new(&stash.name).font(theme::medium(12.5)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            for (label, args) in [
+                                ("Pop", ["stash", "pop", "--index", stash.name.as_str()]),
+                                ("Apply", ["stash", "apply", "--index", stash.name.as_str()]),
+                            ] {
+                                if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                                    acts.push(Action::Ops {
+                                        label: format!("{label} {}", stash.name),
+                                        ops: super::ops(&[&args]),
+                                        refresh: super::Refresh::All,
+                                    });
+                                }
+                            }
+                        });
+                    });
+                });
+        }
         if let Some(err) = &self.detail_error {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -71,7 +107,7 @@ impl RepoTab {
                         ui.horizontal(|ui| {
                             let (rect, _) =
                                 ui.allocate_exact_size(vec2(32.0, 32.0), Sense::hover());
-                            widgets::avatar(ui.painter(), rect.center(), 16.0, &detail.author);
+                            widgets::avatar(ui, rect.center(), 16.0, &detail.author, &detail.email);
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.label(RichText::new(&detail.author).font(theme::medium(12.5)))
@@ -198,6 +234,7 @@ impl RepoTab {
                         selected,
                         RowExtra::Stats(f.added, f.removed),
                     );
+                    widgets::file_menu(&r.row, &f.path, acts);
                     if r.row.clicked() {
                         acts.push(Action::OpenDiff(key));
                     }
@@ -263,7 +300,7 @@ impl RepoTab {
                 if !self.work.conflicted.is_empty() {
                     list_header(ui, "CONFLICTED", self.work.conflicted.len(), None);
                     for f in &self.work.conflicted {
-                        match self.work_row(ui, f, &[("check", "Mark resolved (stage)")]) {
+                        match self.work_row(ui, acts, f, &[("check", "Mark resolved (stage)")]) {
                             RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
                             RowClick::Button(_) => acts.push(stage_action(
                                 "Mark resolved",
@@ -284,8 +321,12 @@ impl RepoTab {
                     acts.push(stage_action("Stage all", vec![vec!["add", "-A"]]));
                 }
                 for f in unstaged {
-                    match self.work_row(ui, f, &[("undo-2", "Discard changes…"), ("plus", "Stage")])
-                    {
+                    match self.work_row(
+                        ui,
+                        acts,
+                        f,
+                        &[("undo-2", "Discard changes…"), ("plus", "Stage")],
+                    ) {
                         RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
                         RowClick::Button(0) => acts.push(Action::Dialog(discard_dialog(f))),
                         RowClick::Button(_) => {
@@ -313,7 +354,7 @@ impl RepoTab {
                     acts.push(stage_action("Unstage all", vec![all]));
                 }
                 for f in staged {
-                    match self.work_row(ui, f, &[("minus", "Unstage")]) {
+                    match self.work_row(ui, acts, f, &[("minus", "Unstage")]) {
                         RowClick::Open => acts.push(Action::OpenDiff(DiffKey::Work(f.clone()))),
                         RowClick::Button(_) => {
                             acts.push(stage_action("Unstage", vec![unstage_args(&head, &f.path)]))
@@ -328,7 +369,13 @@ impl RepoTab {
     }
 
     /// One working-tree file with hover buttons (hidden while an operation runs).
-    fn work_row(&self, ui: &mut Ui, f: &StatusFile, buttons: &[(&str, &str)]) -> RowClick {
+    fn work_row(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        f: &StatusFile,
+        buttons: &[(&str, &str)],
+    ) -> RowClick {
         let key = DiffKey::Work(f.clone());
         let selected = self.open_key() == Some(&key);
         let buttons = if self.busy_op.is_none() { buttons } else { &[] };
@@ -340,6 +387,9 @@ impl RepoTab {
             selected,
             RowExtra::Buttons(buttons),
         );
+        if f.code != 'D' {
+            widgets::file_menu(&r.row, &f.path, acts);
+        }
         match r.button {
             Some(i) => RowClick::Button(i),
             None if r.row.clicked() => RowClick::Open,
@@ -350,11 +400,53 @@ impl RepoTab {
     fn commit_box(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
         let idle = self.busy_op.is_none();
-        ui.label(
-            RichText::new("COMMIT")
+        let rebasing = self.work.in_progress == Some(crate::git::InProgress::Rebase);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if rebasing {
+                    "CONTINUE REBASE"
+                } else {
+                    "COMMIT"
+                })
                 .font(theme::semibold(10.5))
                 .color(t.text_faint),
-        );
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let amend = ui
+                    .add_enabled(
+                        !rebasing && !self.refs.head.is_empty(),
+                        egui::Checkbox::new(&mut self.amend, "Amend last commit"),
+                    )
+                    .on_hover_text(
+                        "Rewrite the last commit with the staged changes and this message",
+                    );
+                if amend.changed() && self.amend && self.commit_summary.trim().is_empty() {
+                    // Start from the message being amended.
+                    if let Ok(msg) = crate::git::head_message(&self.path) {
+                        let (summary, body) = msg.split_once('\n').unwrap_or((msg.as_str(), ""));
+                        self.commit_summary = summary.trim().to_owned();
+                        self.commit_body = body.trim().to_owned();
+                    }
+                }
+            });
+        });
+        if self.amend {
+            let pushed = self
+                .refs
+                .current
+                .as_ref()
+                .and_then(|c| self.refs.local.iter().find(|b| &b.name == c))
+                .is_some_and(|b| !b.upstream.is_empty() && b.ahead_behind().0 == 0);
+            if pushed {
+                ui.label(
+                    RichText::new(
+                        "This commit is already pushed: amending rewrites shared history.",
+                    )
+                    .color(t.warning)
+                    .small(),
+                );
+            }
+        }
         ui.add_space(2.0);
         let summary = ui.add(
             egui::TextEdit::singleline(&mut self.commit_summary)
@@ -379,7 +471,11 @@ impl RepoTab {
         }
         ui.add_space(4.0);
         let staged = self.work.staged.len();
-        let label = if staged > 0 {
+        let label = if rebasing {
+            "Continue rebase".to_owned()
+        } else if self.amend {
+            "Amend last commit".to_owned()
+        } else if staged > 0 {
             format!("Commit {staged} file{}", if staged == 1 { "" } else { "s" })
         } else {
             "Stage all and commit".to_owned()
@@ -393,6 +489,38 @@ impl RepoTab {
             acts.push(Action::Commit);
         }
         resp.on_hover_text("Ctrl+Enter");
+
+        // Who the commit will be by, and the saved identities to switch to.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let id = &self.identity;
+            let who = if id.name.is_empty() {
+                "No identity set (git config user.name)".to_owned()
+            } else {
+                format!(
+                    "as {} <{}>{}",
+                    id.name,
+                    id.email,
+                    if id.local { "" } else { " · global" }
+                )
+            };
+            ui.add(egui::Label::new(RichText::new(who).color(t.text_faint).small()).truncate());
+            let profiles = crate::settings::Settings::get(ui.ctx()).profiles;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let b = icons::small_button(ui, "user-round", "Commit as…");
+                egui::Popup::menu(&b).show(|ui| {
+                    if profiles.is_empty() {
+                        ui.label(RichText::new("Add identities in Settings").color(t.text_faint));
+                    }
+                    for p in &profiles {
+                        let label = format!("{} — {} <{}>", p.label, p.name, p.email);
+                        if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                            acts.push(Action::SetIdentity(p.name.clone(), p.email.clone()));
+                        }
+                    }
+                });
+            });
+        });
     }
 }
 

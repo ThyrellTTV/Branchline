@@ -333,9 +333,15 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool, width: f32) -> Res
     )
 }
 
-/// A round initials avatar, coloured by name so a person keeps their colour everywhere.
-pub fn avatar(painter: &egui::Painter, center: egui::Pos2, radius: f32, name: &str) {
-    let t = Tokens::get(painter.ctx());
+/// A round avatar: the author's picture when one is loaded (see `avatars`), their initials in
+/// a colour of their own until then.
+pub fn avatar(ui: &Ui, center: egui::Pos2, radius: f32, name: &str, email: &str) {
+    let rect = Rect::from_center_size(center, vec2(radius * 2.0, radius * 2.0));
+    if crate::avatars::paint(ui, rect, email) {
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    let painter = ui.painter();
     painter.circle_filled(center, radius, t.lane(name_hash(name)));
     painter.text(
         center,
@@ -360,4 +366,148 @@ fn initials(name: &str) -> String {
 fn name_hash(name: &str) -> usize {
     name.bytes()
         .fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
+}
+
+/// A dot on the top-right corner of a toolbar button (incoming commits…).
+pub fn count_badge(ui: &Ui, button: Rect, color: Color32) {
+    ui.painter()
+        .circle_filled(button.right_top() + vec2(-5.0, 6.0), 3.5, color);
+}
+
+/// The accent line under an active toolbar toggle.
+pub fn active_underline(ui: &Ui, button: Rect, color: Color32) {
+    ui.painter().line_segment(
+        [
+            button.left_bottom() + vec2(6.0, -1.0),
+            button.right_bottom() + vec2(-6.0, -1.0),
+        ],
+        egui::Stroke::new(2.0, color),
+    );
+}
+
+/// The terminal panel's strip: one tab per shell, `+` with a shell menu, and close.
+pub fn terminal_tabs(
+    ui: &mut Ui,
+    terminals: &[crate::terminal::Terminal],
+    active: usize,
+    acts: &mut Vec<super::Action>,
+) {
+    let t = Tokens::get(ui.ctx());
+    let (strip, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
+    ui.painter().rect_filled(strip, 0.0, t.tab_strip);
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(strip.shrink2(vec2(4.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Max)),
+    );
+    let ui = &mut child;
+    ui.spacing_mut().item_spacing.x = 2.0;
+    for (i, term) in terminals.iter().enumerate() {
+        let selected = i == active;
+        let label = format!("{} {}", i + 1, term.shell);
+        let font = if selected {
+            theme::semibold(11.5)
+        } else {
+            theme::medium(11.5)
+        };
+        let galley =
+            ui.painter()
+                .layout_no_wrap(label, font, if selected { t.text } else { t.text_dim });
+        let (rect, resp) =
+            ui.allocate_exact_size(vec2(galley.size().x + 44.0, 26.0), Sense::click());
+        let shape = CornerRadius {
+            nw: t.radius as u8,
+            ne: t.radius as u8,
+            sw: 0,
+            se: 0,
+        };
+        if selected {
+            ui.painter().rect_filled(rect, shape, t.card);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, shape, t.hover);
+        }
+        icons::paint(
+            ui,
+            Rect::from_center_size(pos2(rect.left() + 13.0, rect.center().y), vec2(14.0, 14.0)),
+            "square-terminal",
+            12.0,
+            t.text_faint,
+        );
+        ui.painter().galley(
+            pos2(rect.left() + 24.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            t.text,
+        );
+        let x_rect =
+            Rect::from_center_size(pos2(rect.right() - 11.0, rect.center().y), vec2(16.0, 16.0));
+        let x = ui
+            .interact(x_rect, resp.id.with("close"), Sense::click())
+            .on_hover_text("Close (ends the shell)");
+        if x.hovered() {
+            ui.painter().rect_filled(x_rect, t.radius_sm, t.pressed);
+        }
+        icons::paint(ui, x_rect, "x", 11.0, t.text_faint);
+        if x.clicked() {
+            acts.push(super::Action::CloseTerminal(i));
+        } else if resp.clicked() {
+            acts.push(super::Action::SelectTerminal(i));
+        }
+    }
+    ui.add_space(4.0);
+    let plus = icons::small_button(ui, "plus", "New terminal");
+    if plus.clicked() {
+        acts.push(super::Action::NewTerminal {
+            shell: None,
+            cwd: None,
+        });
+    }
+    egui::Popup::context_menu(&plus).show(|ui| {
+        for shell in crate::terminal::available_shells() {
+            if ui.button(&shell.label).clicked() {
+                acts.push(super::Action::NewTerminal {
+                    shell: Some(shell),
+                    cwd: None,
+                });
+            }
+        }
+    });
+    let more = icons::small_button(ui, "chevron-down", "New terminal with…");
+    egui::Popup::menu(&more).show(|ui| {
+        for shell in crate::terminal::available_shells() {
+            if ui.button(&shell.label).clicked() {
+                acts.push(super::Action::NewTerminal {
+                    shell: Some(shell),
+                    cwd: None,
+                });
+            }
+        }
+    });
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_space(4.0);
+        if icons::small_button(ui, "x", "Hide the panel (shells keep running)").clicked() {
+            acts.push(super::Action::ToggleTerminal);
+        }
+    });
+}
+
+/// Right-click menu for a file of the working tree or a commit: open it, its folder, copy path.
+pub fn file_menu(resp: &Response, path: &str, acts: &mut Vec<super::Action>) {
+    resp.context_menu(|ui| {
+        let rel = std::path::PathBuf::from(path);
+        if ui.button("Open file").clicked() {
+            acts.push(super::Action::OpenPath(rel.clone()));
+        }
+        if ui.button("Open in editor").clicked() {
+            acts.push(super::Action::OpenInEditor(rel.clone()));
+        }
+        if ui.button(super::reveal_label()).clicked() {
+            acts.push(super::Action::OpenPath(
+                rel.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+            ));
+        }
+        ui.separator();
+        if ui.button("Copy path").clicked() {
+            ui.ctx().copy_text(path.to_owned());
+        }
+    });
 }

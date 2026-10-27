@@ -17,7 +17,88 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use crate::theme::{self, Tokens};
 
 const SCROLLBACK: usize = 5000;
-const FONT_SIZE: f32 = 12.5;
+
+/// A shell the terminal can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellSpec {
+    pub label: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl ShellSpec {
+    fn new(label: &str, program: &str, args: &[&str]) -> Self {
+        Self {
+            label: label.to_owned(),
+            program: program.to_owned(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        }
+    }
+}
+
+/// The shells installed on this machine, the platform default first.
+pub fn available_shells() -> Vec<ShellSpec> {
+    let mut list = Vec::new();
+    #[cfg(windows)]
+    {
+        list.push(ShellSpec::new(
+            "Windows PowerShell",
+            "powershell.exe",
+            &["-NoLogo"],
+        ));
+        if on_path("pwsh.exe") {
+            list.insert(0, ShellSpec::new("PowerShell 7", "pwsh.exe", &["-NoLogo"]));
+        }
+        list.push(ShellSpec::new("Command Prompt", "cmd.exe", &[]));
+        for dir in [
+            r"C:\Program Files\Git\bin",
+            r"C:\Program Files (x86)\Git\bin",
+        ] {
+            let bash = Path::new(dir).join("bash.exe");
+            if bash.is_file() {
+                let program = bash.display().to_string();
+                list.push(ShellSpec::new("Git Bash", &program, &["--login", "-i"]));
+                break;
+            }
+        }
+        if on_path("wsl.exe") {
+            list.push(ShellSpec::new("WSL", "wsl.exe", &[]));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            let name = Path::new(&shell)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| shell.clone());
+            list.push(ShellSpec::new(&name, &shell, &[]));
+        }
+        for (label, program) in [
+            ("bash", "/bin/bash"),
+            ("zsh", "/bin/zsh"),
+            ("fish", "/usr/bin/fish"),
+            ("sh", "/bin/sh"),
+        ] {
+            if Path::new(program).is_file() && !list.iter().any(|s| s.program == program) {
+                list.push(ShellSpec::new(label, program, &[]));
+            }
+        }
+    }
+    list
+}
+
+/// The shell to start: the one chosen in the settings when installed, else the default.
+pub fn default_shell(ctx: &egui::Context) -> ShellSpec {
+    let wanted = crate::settings::Settings::get(ctx).shell;
+    let shells = available_shells();
+    shells
+        .iter()
+        .find(|s| !wanted.is_empty() && s.program == wanted)
+        .or_else(|| shells.first())
+        .cloned()
+        .unwrap_or_else(|| ShellSpec::new("sh", "sh", &[]))
+}
 
 pub struct Terminal {
     parser: Arc<Mutex<vt100::Parser>>,
@@ -32,12 +113,14 @@ pub struct Terminal {
     scroll: usize,
     /// Fractional wheel scrolling not yet turned into lines.
     scroll_rest: f32,
+    /// Selected cells, (row, col) on screen, from where the drag started to where it is.
+    selection: Option<((u16, u16), (u16, u16))>,
     pub shell: String,
 }
 
 impl Terminal {
-    /// Starts the user's shell in `cwd`.
-    pub fn spawn(cwd: &Path, ctx: &egui::Context) -> Result<Self, String> {
+    /// Starts `shell` in `cwd`.
+    pub fn spawn(cwd: &Path, shell: &ShellSpec, ctx: &egui::Context) -> Result<Self, String> {
         let (rows, cols) = (24, 100);
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -47,9 +130,9 @@ impl Terminal {
                 pixel_height: 0,
             })
             .map_err(|e| format!("could not open a terminal: {e}"))?;
-        let (program, args) = shell();
+        let program = shell.program.clone();
         let mut cmd = CommandBuilder::new(&program);
-        cmd.args(&args);
+        cmd.args(&shell.args);
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -108,10 +191,7 @@ impl Terminal {
             });
         }
 
-        let shell = Path::new(&program)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(program);
+        let shell = shell.label.clone();
         Ok(Self {
             parser,
             writer,
@@ -121,6 +201,7 @@ impl Terminal {
             size: (rows, cols),
             scroll: 0,
             scroll_rest: 0.0,
+            selection: None,
             shell,
         })
     }
@@ -144,6 +225,7 @@ impl Terminal {
             let _ = w.write_all(bytes);
             let _ = w.flush();
         }
+        self.selection = None;
         // Typing follows the output again.
         if self.scroll != 0 {
             self.scroll = 0;
@@ -154,7 +236,7 @@ impl Terminal {
     /// Paints the screen into all of `ui`'s remaining space and handles input.
     pub fn ui(&mut self, ui: &mut Ui) {
         let t = Tokens::get(ui.ctx());
-        let font = theme::mono(FONT_SIZE);
+        let font = theme::mono(crate::settings::Settings::get(ui.ctx()).terminal_font);
         let glyph = ui
             .painter()
             .layout_no_wrap("M".to_owned(), font.clone(), t.text);
@@ -162,9 +244,29 @@ impl Terminal {
 
         let rect = ui.available_rect_before_wrap();
         let id = ui.id().with("terminal");
-        let resp = ui.interact(rect, id, Sense::click());
+        let resp = ui.interact(rect, id, Sense::click_and_drag());
         ui.allocate_rect(rect, Sense::hover());
-        if resp.clicked() || resp.secondary_clicked() {
+        let inner = rect.shrink2(vec2(8.0, 6.0));
+        let cell_at = |p: egui::Pos2| -> (u16, u16) {
+            let col = ((p.x - inner.left()) / cell.x).floor().max(0.0) as u16;
+            let row = ((p.y - inner.top()) / cell.y).floor().max(0.0) as u16;
+            (row.min(self.size.0.saturating_sub(1)), col.min(self.size.1))
+        };
+        // Drag to select; right-click copies the selection (like Windows Terminal).
+        if resp.drag_started()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            let c = cell_at(p);
+            self.selection = Some((c, c));
+        } else if resp.dragged()
+            && let (Some(p), Some((start, _))) = (resp.interact_pointer_pos(), self.selection)
+        {
+            self.selection = Some((start, cell_at(p)));
+        }
+        if resp.secondary_clicked() && self.copy_selection(ui.ctx()) {
+            resp.request_focus();
+        } else if resp.clicked() || resp.secondary_clicked() {
+            self.selection = None;
             resp.request_focus();
         } else if resp.has_focus()
             && ui.input(|i| i.pointer.any_pressed())
@@ -190,7 +292,6 @@ impl Terminal {
         }
 
         // Size the pty to the panel.
-        let inner = rect.shrink2(vec2(8.0, 6.0));
         let cols = ((inner.width() / cell.x).floor() as u16).clamp(2, 1000);
         let rows = ((inner.height() / cell.y).floor() as u16).clamp(1, 500);
         if (rows, cols) != self.size {
@@ -226,8 +327,13 @@ impl Terminal {
                             self.send(text.as_bytes());
                         }
                     }
-                    // egui turns Ctrl+C / Ctrl+X into clipboard events; the shell wants them.
-                    Event::Copy => self.send(b"\x03"),
+                    // egui turns Ctrl+C / Ctrl+X into clipboard events: copy a selection,
+                    // otherwise the shell gets them.
+                    Event::Copy => {
+                        if !self.copy_selection(ui.ctx()) {
+                            self.send(b"\x03");
+                        }
+                    }
                     Event::Cut => self.send(b"\x18"),
                     Event::Key {
                         key,
@@ -235,7 +341,9 @@ impl Terminal {
                         modifiers,
                         ..
                     } => {
-                        if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
+                        if key == Key::C && modifiers.ctrl && modifiers.shift {
+                            self.copy_selection(ui.ctx());
+                        } else if let Some(bytes) = key_bytes(key, modifiers, app_cursor) {
                             self.send(&bytes);
                         }
                     }
@@ -266,8 +374,29 @@ impl Terminal {
         let (rows, cols) = screen.size();
         let (rows, cols) = (rows.get(), cols.get());
         let palette = Palette::new(&t);
+        let selected = self
+            .selection
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
         for row in 0..rows {
             let y = inner.top() + row as f32 * cell.y;
+            // Selection highlight, under the text.
+            if let Some(((r0, c0), (r1, c1))) = selected
+                && row >= r0
+                && row <= r1
+            {
+                let from = if row == r0 { c0 } else { 0 };
+                let to = if row == r1 { c1 } else { cols };
+                if to > from {
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            pos2(inner.left() + from as f32 * cell.x, y),
+                            vec2((to - from) as f32 * cell.x, cell.y),
+                        ),
+                        0.0,
+                        t.accent.gamma_multiply(0.35),
+                    );
+                }
+            }
             let mut job = LayoutJob::default();
             let mut col = 0;
             while col < cols {
@@ -305,6 +434,7 @@ impl Terminal {
                 col += 1;
             }
             let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let _ = selected;
             painter.galley(pos2(inner.left(), y), galley, t.text);
         }
 
@@ -341,27 +471,31 @@ impl Terminal {
     }
 }
 
-impl Drop for Terminal {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
+impl Terminal {
+    /// Copies the selected text; false when nothing is selected.
+    fn copy_selection(&mut self, ctx: &egui::Context) -> bool {
+        let Some((a, b)) = self.selection else {
+            return false;
+        };
+        let ((r0, c0), (r1, c1)) = if a <= b { (a, b) } else { (b, a) };
+        if (r0, c0) == (r1, c1) {
+            return false;
+        }
+        let text = lock(&self.parser).screen().contents_between(r0, c0, r1, c1);
+        let text = text
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.copy_text(text);
+        self.selection = None;
+        true
     }
 }
 
-/// The shell to run: PowerShell (7 if installed) on Windows, `$SHELL` elsewhere.
-fn shell() -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        let program = if on_path("pwsh.exe") {
-            "pwsh.exe"
-        } else {
-            "powershell.exe"
-        };
-        (program.to_owned(), vec!["-NoLogo".to_owned()])
-    }
-    #[cfg(not(windows))]
-    {
-        let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_owned());
-        (program, Vec::new())
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
     }
 }
 

@@ -8,14 +8,16 @@ use std::process::Command;
 const FS: char = '\x1f';
 const RS: char = '\x1e';
 
-/// How many commits the graph loads per repository.
-pub const LOG_LIMIT: usize = 5000;
+/// How many commits the graph loads at a time; scrolling to the end loads the next page.
+pub const LOG_PAGE: usize = 1500;
 
 fn git_cmd() -> Command {
     let mut cmd = Command::new("git");
     // Never block on an interactive prompt: credential helpers with a GUI still work.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    // `rebase --continue`, `merge --continue`… would otherwise open an editor nobody sees.
+    cmd.env("GIT_EDITOR", "true");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -28,6 +30,23 @@ fn git_cmd() -> Command {
 /// Runs git in `dir` and returns stdout, or the error output.
 pub fn run(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     run_ok_codes(dir, args, &[0])
+}
+
+/// Runs git and returns stdout as raw bytes (file contents: images…).
+pub fn run_bytes(dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut cmd = git_cmd();
+    if let Some(dir) = dir {
+        cmd.arg("-C").arg(dir);
+    }
+    cmd.args(args);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run git: {e}"))?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+    }
 }
 
 /// Like [`run`], but exit codes in `ok` count as success (`diff --no-index` exits 1 on changes).
@@ -182,28 +201,35 @@ pub fn refs(repo: &Path) -> Result<Refs, String> {
     Ok(refs)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Commit {
     pub hash: String,
     pub parents: Vec<String>,
     pub author: String,
+    pub email: String,
+    /// Author time, seconds since the Unix epoch.
+    pub time: i64,
     pub date: String,
     pub summary: String,
     /// Decorations (`HEAD -> main`, `origin/main`, `tag: v1`), as git prints them.
     pub refs: Vec<String>,
 }
 
-/// The commits of every branch, newest first, in an order fit for drawing the graph.
-pub fn log(repo: &Path) -> Result<Vec<Commit>, String> {
-    let format = format!("--format=%H{FS}%P{FS}%an{FS}%ad{FS}%s{FS}%D{RS}");
-    let limit = format!("--max-count={LOG_LIMIT}");
+/// The commits of every branch (stashes aside), newest first, in an order fit for drawing the
+/// graph: `limit` of them after the first `skip`.
+pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String> {
+    let format = format!("--format=%H{FS}%P{FS}%an{FS}%ae{FS}%at{FS}%ad{FS}%s{FS}%D{RS}");
+    let limit = format!("--max-count={limit}");
+    let skip = format!("--skip={skip}");
     let out = match run(
         Some(repo),
         &[
             "log",
+            "--exclude=refs/stash",
             "--all",
             "--date-order",
             "--date=format-local:%Y-%m-%d %H:%M",
+            &skip,
             &limit,
             &format,
         ],
@@ -220,13 +246,15 @@ pub fn log(repo: &Path) -> Result<Vec<Commit>, String> {
             continue;
         }
         let f: Vec<&str> = record.split(FS).collect();
-        let [hash, parents, author, date, summary, decor] = f[..] else {
+        let [hash, parents, author, email, time, date, summary, decor] = f[..] else {
             continue;
         };
         commits.push(Commit {
             hash: hash.to_owned(),
             parents: parents.split_whitespace().map(str::to_owned).collect(),
             author: author.to_owned(),
+            email: email.to_owned(),
+            time: time.parse().unwrap_or(0),
             date: date.to_owned(),
             summary: summary.to_owned(),
             refs: decor
@@ -371,20 +399,14 @@ fn parse_numstat(out: &str) -> Vec<(String, Option<u32>, Option<u32>)> {
     result
 }
 
-/// The patch of one file in a commit.
-pub fn file_diff(repo: &Path, hash: &str, path: &str) -> Result<String, String> {
-    run(
-        Some(repo),
-        &[
-            "show",
-            "--format=",
-            "--diff-merges=first-parent",
-            "-M",
-            hash,
-            "--",
-            path,
-        ],
-    )
+/// The patch of one file in a commit (`ignore_ws`: `-w`).
+pub fn file_diff(repo: &Path, hash: &str, path: &str, ignore_ws: bool) -> Result<String, String> {
+    let mut args = vec!["show", "--format=", "--diff-merges=first-parent", "-M"];
+    if ignore_ws {
+        args.push("-w");
+    }
+    args.extend([hash, "--", path]);
+    run(Some(repo), &args)
 }
 
 /// Which side of the index a working-tree file is listed on.
@@ -411,6 +433,7 @@ pub enum InProgress {
     Merge,
     CherryPick,
     Revert,
+    Rebase,
 }
 
 impl InProgress {
@@ -419,6 +442,7 @@ impl InProgress {
             InProgress::Merge => "Merge",
             InProgress::CherryPick => "Cherry-pick",
             InProgress::Revert => "Revert",
+            InProgress::Rebase => "Rebase",
         }
     }
 
@@ -428,6 +452,7 @@ impl InProgress {
             InProgress::Merge => "merge",
             InProgress::CherryPick => "cherry-pick",
             InProgress::Revert => "revert",
+            InProgress::Rebase => "rebase",
         }
     }
 }
@@ -530,12 +555,21 @@ pub fn status(repo: &Path) -> Result<WorkStatus, String> {
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     let mut status = parse_status(&out);
+    for dir in ["rebase-merge", "rebase-apply"] {
+        if let Ok(path) = run(Some(repo), &["rev-parse", "--git-path", dir])
+            && repo.join(path.trim()).is_dir()
+        {
+            status.in_progress = Some(InProgress::Rebase);
+        }
+    }
     for (state, head) in [
         (InProgress::Merge, "MERGE_HEAD"),
         (InProgress::CherryPick, "CHERRY_PICK_HEAD"),
         (InProgress::Revert, "REVERT_HEAD"),
     ] {
-        if run(Some(repo), &["rev-parse", "-q", "--verify", head]).is_ok() {
+        if status.in_progress.is_none()
+            && run(Some(repo), &["rev-parse", "-q", "--verify", head]).is_ok()
+        {
             status.in_progress = Some(state);
             break;
         }
@@ -597,12 +631,19 @@ fn parse_status(out: &str) -> WorkStatus {
     status
 }
 
-/// The patch of one uncommitted file.
-pub fn work_diff(repo: &Path, file: &StatusFile) -> Result<String, String> {
+/// The patch of one uncommitted file (`ignore_ws`: `-w`).
+pub fn work_diff(repo: &Path, file: &StatusFile, ignore_ws: bool) -> Result<String, String> {
     let path = file.path.as_str();
+    let mut args: Vec<&str> = match file.area {
+        Area::Staged => vec!["diff", "--cached", "-M"],
+        _ => vec!["diff"],
+    };
+    if ignore_ws {
+        args.push("-w");
+    }
+    args.extend(["--", path]);
     match file.area {
-        Area::Staged => run(Some(repo), &["diff", "--cached", "-M", "--", path]),
-        Area::Unstaged | Area::Conflicted => run(Some(repo), &["diff", "--", path]),
+        Area::Staged | Area::Unstaged | Area::Conflicted => run(Some(repo), &args),
         // An untracked file has no history: show it as all added.
         Area::Untracked => run_ok_codes(
             Some(repo),
@@ -610,6 +651,169 @@ pub fn work_diff(repo: &Path, file: &StatusFile) -> Result<String, String> {
             &[0, 1],
         ),
     }
+}
+
+/// The contents of `path` at `rev` (`HEAD`, a hash, or `""` for the index), or from disk when
+/// `rev` is `None`.
+pub fn file_at(repo: &Path, rev: Option<&str>, path: &str) -> Result<Vec<u8>, String> {
+    match rev {
+        None => std::fs::read(repo.join(path)).map_err(|e| format!("{path}: {e}")),
+        Some(rev) => run_bytes(Some(repo), &["show", &format!("{rev}:{path}")]),
+    }
+}
+
+/// HEAD's commit hash, or empty before the first commit.
+pub fn head(repo: &Path) -> String {
+    run(Some(repo), &["rev-parse", "--verify", "-q", "HEAD"])
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// The full message of HEAD (to amend it).
+pub fn head_message(repo: &Path) -> Result<String, String> {
+    run(Some(repo), &["log", "-1", "--format=%B"]).map(|s| s.trim_end().to_owned())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stash {
+    /// `stash@{0}`.
+    pub name: String,
+    pub hash: String,
+    pub message: String,
+    pub time: i64,
+}
+
+pub fn stashes(repo: &Path) -> Result<Vec<Stash>, String> {
+    let out = run(
+        Some(repo),
+        &[
+            "stash",
+            "list",
+            &format!("--format=%gd{FS}%H{FS}%gs{FS}%at"),
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split(FS).collect();
+            let [name, hash, message, time] = f[..] else {
+                return None;
+            };
+            // `On main: wip` / `WIP on main: 1234 msg` → the part after the colon reads better.
+            let message = message
+                .split_once(": ")
+                .map(|(_, m)| m)
+                .unwrap_or(message)
+                .to_owned();
+            Some(Stash {
+                name: name.to_owned(),
+                hash: hash.to_owned(),
+                message,
+                time: time.parse().unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    pub name: String,
+    pub url: String,
+}
+
+pub fn remotes(repo: &Path) -> Result<Vec<Remote>, String> {
+    let out = run(Some(repo), &["remote", "-v"])?;
+    let mut list: Vec<Remote> = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(name), Some(url)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !list.iter().any(|r| r.name == name) {
+            list.push(Remote {
+                name: name.to_owned(),
+                url: url.to_owned(),
+            });
+        }
+    }
+    Ok(list)
+}
+
+/// Commits whose message or author matches `query` (case-insensitive), or whose hash starts
+/// with it, newest first.
+pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
+    let mut hashes: Vec<String> = Vec::new();
+    let base = [
+        "log",
+        "--exclude=refs/stash",
+        "--all",
+        "--date-order",
+        "-i",
+        "--format=%H",
+    ];
+    for filter in [format!("--grep={query}"), format!("--author={query}")] {
+        let mut args = base.to_vec();
+        args.push("--fixed-strings");
+        args.push(&filter);
+        if let Ok(out) = run(Some(repo), &args) {
+            for h in out.lines() {
+                if !hashes.iter().any(|x| x == h) {
+                    hashes.push(h.to_owned());
+                }
+            }
+        }
+    }
+    let q = query.trim();
+    if q.len() >= 4
+        && q.chars().all(|c| c.is_ascii_hexdigit())
+        && let Ok(h) = run(
+            Some(repo),
+            &["rev-parse", "--verify", "-q", &format!("{q}^{{commit}}")],
+        )
+    {
+        hashes.insert(0, h.trim().to_owned());
+    }
+    Ok(hashes)
+}
+
+/// The name and email commits are made with here, and whether they're set for this repository
+/// only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
+    pub local: bool,
+}
+
+pub fn identity(repo: &Path) -> Identity {
+    let get = |args: &[&str]| run(Some(repo), args).map(|s| s.trim().to_owned()).ok();
+    Identity {
+        name: get(&["config", "user.name"]).unwrap_or_default(),
+        email: get(&["config", "user.email"]).unwrap_or_default(),
+        local: get(&["config", "--local", "user.name"]).is_some(),
+    }
+}
+
+/// "3 minutes ago", "2 days ago"… for `time` seen from `now` (both Unix seconds).
+pub fn relative_time(time: i64, now: i64) -> String {
+    let secs = (now - time).max(0);
+    let (n, unit) = match secs {
+        0..60 => return "just now".to_owned(),
+        60..3_600 => (secs / 60, "minute"),
+        3_600..86_400 => (secs / 3_600, "hour"),
+        86_400..604_800 => (secs / 86_400, "day"),
+        604_800..2_629_800 => (secs / 604_800, "week"),
+        2_629_800..31_557_600 => (secs / 2_629_800, "month"),
+        _ => (secs / 31_557_600, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+pub fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -633,6 +837,17 @@ mod tests {
             vec![('M', "both.rs"), ('?', "fresh.txt"), ('D', "gone.rs")]
         );
         assert_eq!(s.conflicted.len(), 1);
+    }
+
+    #[test]
+    fn relative_times() {
+        assert_eq!(relative_time(1000, 1030), "just now");
+        assert_eq!(relative_time(0, 60), "1 minute ago");
+        assert_eq!(relative_time(0, 2 * 3_600), "2 hours ago");
+        assert_eq!(relative_time(0, 5 * 86_400), "5 days ago");
+        assert_eq!(relative_time(0, 3 * 604_800), "3 weeks ago");
+        assert_eq!(relative_time(0, 400 * 86_400), "1 year ago");
+        assert_eq!(relative_time(100, 50), "just now");
     }
 
     #[test]

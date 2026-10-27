@@ -1,41 +1,58 @@
 //! One open repository: its state, background git work and the view
 //! (branches on the left, commit graph or diff in the middle, commit detail / changes on the right).
 
+mod conflict;
 mod detail;
 mod dialogs;
 mod diff;
 mod graph_view;
+mod highlight;
 mod sidebar;
 pub(crate) mod widgets;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use egui::{Key, Ui};
 
-use crate::git::{self, Commit, CommitDetail, InProgress, Refs, StatusFile, WorkStatus, Worktree};
+use crate::forge::{self, Forge, PullRequest};
+use crate::git::{
+    self, Commit, CommitDetail, Identity, InProgress, Refs, Remote, Stash, StatusFile, WorkStatus,
+    Worktree,
+};
 use crate::graph::{self, Graph};
 use crate::icons;
-use crate::terminal::Terminal;
+use crate::settings::Settings;
+use crate::terminal::{ShellSpec, Terminal};
 use crate::theme::Tokens;
 
 pub use dialogs::Dialog;
-use diff::DiffLine;
+pub use widgets::primary_button;
 
 /// Hash of the pseudo-commit that stands for uncommitted changes at the top of the graph.
 pub(crate) const WIP_HASH: &str = "\u{0}wip";
+/// History deeper than this isn't loaded by scrolling or searching.
+const MAX_HISTORY: usize = 100_000;
+/// An operation that takes longer than this gets a notification when it ends.
+const LONG_OP: Duration = Duration::from_secs(4);
 
 /// Results coming back from background git calls.
 enum Msg {
     Loaded(Result<Box<Loaded>, String>),
+    More(Result<Vec<Commit>, String>),
     Status(Result<WorkStatus, String>),
     Detail(String, Result<CommitDetail, String>),
-    Diff(DiffKey, Result<String, String>),
+    Diff(DiffKey, Result<diff::DiffData, String>),
+    Search(String, Result<Vec<String>, String>),
+    Prs(Result<Vec<PullRequest>, String>),
     OpDone {
         label: String,
         result: Result<String, String>,
         refresh: Refresh,
+        kind: OpKind,
+        quiet: bool,
     },
 }
 
@@ -44,6 +61,11 @@ struct Loaded {
     history: Vec<Commit>,
     work: WorkStatus,
     worktrees: Vec<Worktree>,
+    stashes: Vec<Stash>,
+    remotes: Vec<Remote>,
+    identity: Identity,
+    /// How many commits were asked for (more exist when that many came back).
+    requested: usize,
 }
 
 /// What to re-read after an operation.
@@ -52,6 +74,36 @@ pub(crate) enum Refresh {
     /// Only the working tree (staging changes nothing else).
     Status,
     All,
+}
+
+/// How an operation can be undone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Undo {
+    None,
+    /// The operation moved HEAD (commit, merge, reset…): undo moves it back with
+    /// `git reset <mode>`, redo forward again. `--soft` keeps the changes staged.
+    HeadMove {
+        mode: &'static str,
+    },
+    /// Explicit commands each way (branch create/delete/rename, checkout, tags, stash).
+    Custom {
+        undo: Vec<Vec<String>>,
+        redo: Vec<Vec<String>>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UndoEntry {
+    label: String,
+    undo: Vec<Vec<String>>,
+    redo: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+enum OpKind {
+    Normal(Undo, String),
+    Undo(UndoEntry),
+    Redo(UndoEntry),
 }
 
 /// Which diff the central area shows.
@@ -63,13 +115,28 @@ pub(crate) enum DiffKey {
 
 pub(crate) struct DiffView {
     key: DiffKey,
-    lines: Option<Result<Vec<DiffLine>, String>>,
+    data: Option<Result<diff::DiffData, String>>,
+}
+
+#[derive(Default)]
+struct Search {
+    open: bool,
+    focus: bool,
+    query: String,
+    /// The query the results are for.
+    searched: String,
+    results: Vec<String>,
+    matches: HashSet<String>,
+    current: usize,
+    running: bool,
+    edited: Option<Instant>,
 }
 
 /// Everything the views ask for; applied after drawing so views only borrow the state.
 pub(crate) enum Action {
     Select(usize),
     SelectHash(String),
+    SelectStash(usize),
     OpenDiff(DiffKey),
     CloseDiff,
     Ops {
@@ -77,18 +144,52 @@ pub(crate) enum Action {
         ops: Vec<Vec<String>>,
         refresh: Refresh,
     },
+    UndoableOps {
+        label: String,
+        ops: Vec<Vec<String>>,
+        refresh: Refresh,
+        undo: Undo,
+    },
     Checkout(String),
     CheckoutRemote(String),
     Dialog(Dialog),
     Commit,
     Fetch,
-    /// Open a folder (a worktree) in its own tab.
-    OpenTab(PathBuf),
-    ToggleTerminal,
-    RestartTerminal,
     Pull,
     Push,
     Reload,
+    LoadMore,
+    Undo,
+    Redo,
+    StashPush(String),
+    /// Open a folder (a worktree) in its own tab.
+    OpenTab(PathBuf),
+    ToggleTerminal,
+    NewTerminal {
+        shell: Option<ShellSpec>,
+        cwd: Option<PathBuf>,
+    },
+    CloseTerminal(usize),
+    SelectTerminal(usize),
+    ToggleSearch,
+    SearchStep(i32),
+    CreatePr {
+        branch: String,
+        base: String,
+        title: String,
+        body: String,
+        draft: bool,
+    },
+    OpenUrl(String),
+    /// Open a path (relative to the repository) with the system's default app.
+    OpenPath(PathBuf),
+    OpenInEditor(PathBuf),
+    SetIdentity(String, String),
+    SetDiffOptions {
+        split: bool,
+        ignore_ws: bool,
+    },
+    SaveConflict,
 }
 
 pub struct RepoTab {
@@ -102,33 +203,72 @@ pub struct RepoTab {
     refs: Refs,
     /// Commits as git listed them.
     history: Vec<Commit>,
+    has_more: bool,
+    loading_more: bool,
     work: WorkStatus,
     /// Rows of the graph: the WIP pseudo-commit (when the tree is dirty) followed by `history`.
     commits: Vec<Commit>,
     graph: Graph,
     index: HashMap<String, usize>,
+    worktrees: Vec<Worktree>,
+    stashes: Vec<Stash>,
+    remotes: Vec<Remote>,
+    identity: Identity,
+    forge: Option<Forge>,
+    prs: Vec<PullRequest>,
+    pr_error: Option<String>,
+    prs_loaded: Option<Instant>,
 
     selected: Option<usize>,
+    /// A stash shown in the detail pane instead of a graph row.
+    stash_view: Option<usize>,
     scroll_to: Option<usize>,
+    /// The commit the detail pane is about (a graph row or a stash).
+    detail_hash: Option<String>,
     detail: Option<CommitDetail>,
     detail_error: Option<String>,
     diff: Option<DiffView>,
+    diff_split: bool,
+    diff_ignore_ws: bool,
+    conflict: Option<conflict::ConflictEditor>,
 
     commit_summary: String,
     commit_body: String,
+    amend: bool,
     dialog: Option<Dialog>,
+    search: Search,
+    /// A commit to select once enough history is loaded (search results, links).
+    pending_goto: Option<String>,
+
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
 
     busy_op: Option<String>,
+    op_started: Option<Instant>,
     status: Option<(String, bool)>,
     branch_filter: String,
     /// Jump to the changes row on the next rebuild (after an operation left conflicts).
     focus_wip: bool,
-    worktrees: Vec<Worktree>,
-    terminal: Option<Terminal>,
+    last_fetch: Instant,
+
+    terminals: Vec<Terminal>,
+    active_terminal: usize,
     terminal_open: bool,
     terminal_error: Option<String>,
+
+    watcher: Option<notify::RecommendedWatcher>,
+    fs_rx: Option<Receiver<bool>>,
+    /// A change on disk not yet reloaded: (inside .git, when).
+    fs_pending: Option<(bool, Instant)>,
+
+    /// Actions queued from outside (the command palette).
+    queued: Vec<Action>,
     /// A folder the app should open in a new tab (taken by `App`).
     pub open_request: Option<PathBuf>,
+    /// The app has a dialog of its own open (palette, settings): leave the keys to it.
+    pub keys_blocked: bool,
+    /// A long operation that just ended: (message, failed), for a notification (taken by `App`).
+    pub finished: Option<(String, bool)>,
 }
 
 impl RepoTab {
@@ -147,6 +287,8 @@ impl RepoTab {
             load_error: None,
             refs: Refs::default(),
             history: Vec::new(),
+            has_more: false,
+            loading_more: false,
             work: WorkStatus::default(),
             commits: Vec::new(),
             graph: Graph {
@@ -154,24 +296,51 @@ impl RepoTab {
                 width: 0,
             },
             index: HashMap::new(),
+            worktrees: Vec::new(),
+            stashes: Vec::new(),
+            remotes: Vec::new(),
+            identity: Identity::default(),
+            forge: None,
+            prs: Vec::new(),
+            pr_error: None,
+            prs_loaded: None,
             selected: None,
+            stash_view: None,
             scroll_to: None,
+            detail_hash: None,
             detail: None,
             detail_error: None,
             diff: None,
+            diff_split: false,
+            diff_ignore_ws: false,
+            conflict: None,
             commit_summary: String::new(),
             commit_body: String::new(),
+            amend: false,
             dialog: None,
+            search: Search::default(),
+            pending_goto: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             busy_op: None,
+            op_started: None,
             status: None,
             branch_filter: String::new(),
             focus_wip: false,
-            worktrees: Vec::new(),
-            terminal: None,
+            last_fetch: Instant::now(),
+            terminals: Vec::new(),
+            active_terminal: 0,
             terminal_open: false,
             terminal_error: None,
+            watcher: None,
+            fs_rx: None,
+            fs_pending: None,
+            queued: Vec::new(),
             open_request: None,
+            keys_blocked: false,
+            finished: None,
         };
+        tab.watch(ctx);
         tab.reload(ctx);
         tab
     }
@@ -180,25 +349,39 @@ impl RepoTab {
         self.loading || self.busy_op.is_some()
     }
 
-    /// Re-reads refs, history and working-tree status in the background.
+    /// Queues an action from outside the tab (the command palette).
+    pub(crate) fn queue(&mut self, action: Action) {
+        self.queued.push(action);
+    }
+
+    /// Re-reads refs, history, working tree, worktrees, stashes and remotes in the background.
     pub fn reload(&mut self, ctx: &egui::Context) {
         if self.loading {
             return;
         }
         self.loading = true;
         let path = self.path.clone();
+        // Keep the pages already loaded.
+        let count = self.history.len().clamp(git::LOG_PAGE, MAX_HISTORY);
         spawn(&self.tx, ctx, move || {
             Msg::Loaded((|| {
                 let refs = git::refs(&path)?;
-                let history = git::log(&path)?;
+                let history = git::log(&path, 0, count)?;
                 let work = git::status(&path)?;
                 // Very old gits have no `worktree list`; the section just stays empty.
                 let worktrees = git::worktrees(&path).unwrap_or_default();
+                let stashes = git::stashes(&path).unwrap_or_default();
+                let remotes = git::remotes(&path).unwrap_or_default();
+                let identity = git::identity(&path);
                 Ok(Box::new(Loaded {
                     refs,
                     history,
                     work,
                     worktrees,
+                    stashes,
+                    remotes,
+                    identity,
+                    requested: count,
                 }))
             })())
         });
@@ -207,6 +390,68 @@ impl RepoTab {
     fn reload_status(&mut self, ctx: &egui::Context) {
         let path = self.path.clone();
         spawn(&self.tx, ctx, move || Msg::Status(git::status(&path)));
+    }
+
+    fn load_more(&mut self, ctx: &egui::Context) {
+        if self.loading_more || !self.has_more || self.history.len() >= MAX_HISTORY {
+            return;
+        }
+        self.loading_more = true;
+        let path = self.path.clone();
+        let skip = self.history.len();
+        spawn(&self.tx, ctx, move || {
+            Msg::More(git::log(&path, skip, git::LOG_PAGE))
+        });
+    }
+
+    fn load_prs(&mut self, ctx: &egui::Context) {
+        let Some(forge) = self.forge else { return };
+        self.prs_loaded = Some(Instant::now());
+        let path = self.path.clone();
+        spawn(&self.tx, ctx, move || Msg::Prs(forge::list(&path, forge)));
+    }
+
+    /// Watches the folder so changes made elsewhere (editor, terminal) show up by themselves.
+    fn watch(&mut self, ctx: &egui::Context) {
+        use notify::Watcher;
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        let handler = move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            for path in &event.paths {
+                let s = path.to_string_lossy().replace('\\', "/");
+                match s.split_once("/.git/") {
+                    // Refs, HEAD, the index and merge state matter; objects and logs don't.
+                    Some((_, inside)) => {
+                        let relevant = inside.starts_with("refs")
+                            || inside == "HEAD"
+                            || inside == "index"
+                            || inside == "packed-refs"
+                            || inside.ends_with("_HEAD")
+                            || inside.starts_with("rebase-");
+                        if relevant {
+                            let _ = tx.send(true);
+                            ctx.request_repaint_after(Duration::from_millis(500));
+                        }
+                    }
+                    None => {
+                        let _ = tx.send(false);
+                        ctx.request_repaint_after(Duration::from_millis(500));
+                    }
+                }
+            }
+        };
+        if let Ok(mut watcher) = notify::recommended_watcher(handler)
+            && watcher
+                .watch(&self.path, notify::RecursiveMode::Recursive)
+                .is_ok()
+        {
+            self.watcher = Some(watcher);
+            self.fs_rx = Some(rx);
+        }
     }
 
     fn is_wip(&self, row: usize) -> bool {
@@ -231,10 +476,8 @@ impl RepoTab {
                 } else {
                     vec![self.refs.head.clone()]
                 },
-                author: String::new(),
-                date: String::new(),
-                summary: String::new(),
-                refs: Vec::new(),
+                time: git::now(),
+                ..Commit::default()
             });
         }
         self.commits.extend(self.history.iter().cloned());
@@ -250,20 +493,23 @@ impl RepoTab {
         let mut keep = previous.as_ref().and_then(|h| self.index.get(h).copied());
         if std::mem::take(&mut self.focus_wip) && self.index.contains_key(WIP_HASH) {
             keep = None;
+            self.stash_view = None;
         }
-        let target = keep
-            .or_else(|| self.index.get(WIP_HASH).copied())
-            .or_else(|| self.index.get(&self.refs.head).copied());
-        match target {
-            Some(row) if keep == Some(row) => self.selected = Some(row),
-            Some(row) => {
-                self.selected = None;
-                self.select(row, ctx);
-                self.scroll_to = Some(row);
-            }
-            None => {
-                self.selected = None;
-                self.detail = None;
+        if self.stash_view.is_none() {
+            let target = keep
+                .or_else(|| self.index.get(WIP_HASH).copied())
+                .or_else(|| self.index.get(&self.refs.head).copied());
+            match target {
+                Some(row) if keep == Some(row) => self.selected = Some(row),
+                Some(row) => {
+                    self.selected = None;
+                    self.select(row, ctx);
+                    self.scroll_to = Some(row);
+                }
+                None => {
+                    self.selected = None;
+                    self.detail = None;
+                }
             }
         }
 
@@ -290,13 +536,16 @@ impl RepoTab {
                 .chain(&self.work.unstaged)
                 .chain(&self.work.conflicted)
                 .any(|f| f == file);
+            let key = DiffKey::Work(file.clone());
+            self.diff = None;
+            self.conflict = None;
             if still {
-                let key = DiffKey::Work(file.clone());
-                self.diff = None;
                 self.open_diff(key, ctx);
-            } else {
-                self.diff = None;
             }
+        }
+
+        if let Some(hash) = self.pending_goto.clone() {
+            self.goto(&hash, ctx);
         }
     }
 
@@ -304,31 +553,52 @@ impl RepoTab {
         let Some(commit) = self.commits.get(row) else {
             return;
         };
-        if self.selected == Some(row) {
+        if self.selected == Some(row) && self.stash_view.is_none() {
             return;
         }
+        let hash = commit.hash.clone();
         self.selected = Some(row);
-        self.detail = None;
-        self.detail_error = None;
+        self.stash_view = None;
         if matches!(
             self.diff,
             Some(DiffView {
                 key: DiffKey::Commit { .. },
                 ..
             })
-        ) || !self.is_wip(row)
+        ) || hash != WIP_HASH
         {
             self.diff = None;
+            self.conflict = None;
         }
-        if commit.hash == WIP_HASH {
+        if hash == WIP_HASH {
+            self.detail = None;
+            self.detail_hash = None;
             return;
         }
+        self.load_detail(hash, ctx);
+    }
+
+    fn load_detail(&mut self, hash: String, ctx: &egui::Context) {
+        self.detail = None;
+        self.detail_error = None;
+        self.detail_hash = Some(hash.clone());
         let path = self.path.clone();
-        let hash = commit.hash.clone();
         spawn(&self.tx, ctx, move || {
             let detail = git::commit_detail(&path, &hash);
             Msg::Detail(hash, detail)
         });
+    }
+
+    fn select_stash(&mut self, i: usize, ctx: &egui::Context) {
+        let Some(stash) = self.stashes.get(i) else {
+            return;
+        };
+        let hash = stash.hash.clone();
+        self.stash_view = Some(i);
+        self.selected = None;
+        self.diff = None;
+        self.conflict = None;
+        self.load_detail(hash, ctx);
     }
 
     fn select_hash(&mut self, hash: &str, ctx: &egui::Context) {
@@ -349,24 +619,52 @@ impl RepoTab {
         }
     }
 
-    /// Shows a diff in the central area; asking for the open one closes it.
+    /// Selects `hash`, loading more history first if it's further down.
+    fn goto(&mut self, hash: &str, ctx: &egui::Context) {
+        if self.index.contains_key(hash) {
+            self.pending_goto = None;
+            self.select_hash(hash, ctx);
+        } else if self.has_more && self.history.len() < MAX_HISTORY {
+            self.pending_goto = Some(hash.to_owned());
+            self.load_more(ctx);
+        } else {
+            self.pending_goto = None;
+            self.select_hash(hash, ctx);
+        }
+    }
+
+    /// Shows a diff (or the conflict editor) in the central area; asking for the open one
+    /// closes it.
     fn open_diff(&mut self, key: DiffKey, ctx: &egui::Context) {
         if self.diff.as_ref().is_some_and(|d| d.key == key) {
             self.diff = None;
+            self.conflict = None;
             return;
         }
+        self.conflict = match &key {
+            DiffKey::Work(file) if file.area == git::Area::Conflicted => {
+                conflict::ConflictEditor::open(&self.path, &file.path, self.work.in_progress)
+            }
+            _ => None,
+        };
         self.diff = Some(DiffView {
             key: key.clone(),
-            lines: None,
+            data: None,
         });
         let path = self.path.clone();
+        let ignore_ws = self.diff_ignore_ws;
+        let dark = Tokens::get(ctx).dark();
         spawn(&self.tx, ctx, move || {
-            let result = match &key {
-                DiffKey::Commit { hash, path: file } => git::file_diff(&path, hash, file),
-                DiffKey::Work(file) => git::work_diff(&path, file),
-            };
+            let result = diff::load(&path, &key, ignore_ws, dark);
             Msg::Diff(key, result)
         });
+    }
+
+    fn reopen_diff(&mut self, ctx: &egui::Context) {
+        if let Some(view) = self.diff.take() {
+            self.conflict = None;
+            self.open_diff(view.key, ctx);
+        }
     }
 
     /// Runs git commands one after another (stopping at the first failure), then refreshes.
@@ -375,13 +673,29 @@ impl RepoTab {
         label: &str,
         ops: Vec<Vec<String>>,
         refresh: Refresh,
+        kind: OpKind,
+        ctx: &egui::Context,
+    ) {
+        self.run_ops_ex(label, ops, refresh, kind, false, ctx);
+    }
+
+    fn run_ops_ex(
+        &mut self,
+        label: &str,
+        ops: Vec<Vec<String>>,
+        refresh: Refresh,
+        kind: OpKind,
+        quiet: bool,
         ctx: &egui::Context,
     ) {
         if self.busy_op.is_some() {
             return;
         }
         self.busy_op = Some(label.to_owned());
-        self.status = None;
+        self.op_started = Some(Instant::now());
+        if !quiet {
+            self.status = None;
+        }
         let path = self.path.clone();
         let label = label.to_owned();
         spawn(&self.tx, ctx, move || {
@@ -393,12 +707,60 @@ impl RepoTab {
                     break;
                 }
             }
+            // For HEAD moves, the new HEAD is what redo goes back to.
+            let kind = match kind {
+                OpKind::Normal(Undo::HeadMove { mode }, before) if result.is_ok() => {
+                    OpKind::Normal(
+                        Undo::HeadMove { mode },
+                        format!("{before}\u{0}{}", git::head(&path)),
+                    )
+                }
+                other => other,
+            };
             Msg::OpDone {
                 label,
                 result,
                 refresh,
+                kind,
+                quiet,
             }
         });
+    }
+
+    /// Runs `ops` as an undoable step.
+    fn run_undoable(
+        &mut self,
+        label: &str,
+        ops: Vec<Vec<String>>,
+        refresh: Refresh,
+        undo: Undo,
+        ctx: &egui::Context,
+    ) {
+        let before = self.refs.head.clone();
+        self.run_ops(label, ops, refresh, OpKind::Normal(undo, before), ctx);
+    }
+
+    fn checkout(&mut self, target: &str, ctx: &egui::Context) {
+        let previous = self
+            .refs
+            .current
+            .clone()
+            .unwrap_or_else(|| self.refs.head.clone());
+        let undo = if previous.is_empty() {
+            Undo::None
+        } else {
+            Undo::Custom {
+                undo: ops(&[&["checkout", &previous]]),
+                redo: ops(&[&["checkout", target]]),
+            }
+        };
+        self.run_undoable(
+            &format!("Checkout {target}"),
+            ops(&[&["checkout", target]]),
+            Refresh::All,
+            undo,
+            ctx,
+        );
     }
 
     fn checkout_remote(&mut self, remote_branch: &str, ctx: &egui::Context) {
@@ -406,13 +768,36 @@ impl RepoTab {
         let local = remote_branch
             .split_once('/')
             .map(|(_, b)| b)
-            .unwrap_or(remote_branch);
-        let op = if self.refs.local.iter().any(|b| b.name == local) {
-            ops(&[&["checkout", local]])
-        } else {
-            ops(&[&["checkout", "--track", remote_branch]])
-        };
-        self.run_ops(&format!("Checkout {local}"), op, Refresh::All, ctx);
+            .unwrap_or(remote_branch)
+            .to_owned();
+        if self.refs.local.iter().any(|b| b.name == local) {
+            self.checkout(&local, ctx);
+            return;
+        }
+        let previous = self
+            .refs
+            .current
+            .clone()
+            .unwrap_or_else(|| self.refs.head.clone());
+        self.run_undoable(
+            &format!("Checkout {local}"),
+            ops(&[&["checkout", "--track", remote_branch]]),
+            Refresh::All,
+            Undo::Custom {
+                undo: ops(&[&["checkout", &previous], &["branch", "-D", &local]]),
+                redo: ops(&[&["checkout", "--track", remote_branch]]),
+            },
+            ctx,
+        );
+    }
+
+    fn default_remote(&self) -> Option<String> {
+        self.remotes
+            .iter()
+            .map(|r| r.name.as_str())
+            .find(|r| *r == "origin")
+            .or_else(|| self.remotes.first().map(|r| r.name.as_str()))
+            .map(str::to_owned)
     }
 
     fn push(&mut self, ctx: &egui::Context) {
@@ -426,23 +811,22 @@ impl RepoTab {
             .iter()
             .any(|b| b.name == current && !b.upstream.is_empty() && !b.upstream_gone());
         if has_upstream {
-            self.run_ops("Push", ops(&[&["push"]]), Refresh::All, ctx);
+            self.run_ops(
+                "Push",
+                ops(&[&["push"]]),
+                Refresh::All,
+                OpKind::Normal(Undo::None, String::new()),
+                ctx,
+            );
             return;
         }
         // First push of a branch: publish it and track the remote one.
-        let remote = self
-            .refs
-            .remotes
-            .iter()
-            .map(|(r, _)| r.as_str())
-            .find(|r| *r == "origin")
-            .or_else(|| self.refs.remotes.first().map(|(r, _)| r.as_str()))
-            .map(str::to_owned);
-        match remote {
+        match self.default_remote() {
             Some(remote) => self.run_ops(
                 &format!("Push {current} to {remote}"),
                 ops(&[&["push", "-u", &remote, &current]]),
                 Refresh::All,
+                OpKind::Normal(Undo::None, String::new()),
                 ctx,
             ),
             None => {
@@ -461,130 +845,533 @@ impl RepoTab {
             self.status = Some(("Resolve the conflicted files first".to_owned(), true));
             return;
         }
-        let mut commit = vec!["commit".to_owned(), "-m".to_owned(), summary.to_owned()];
+        let mut commit = vec!["commit".to_owned()];
+        if self.amend {
+            commit.push("--amend".to_owned());
+        }
+        commit.extend(["-m".to_owned(), summary.to_owned()]);
         let body = self.commit_body.trim();
         if !body.is_empty() {
             commit.extend(["-m".to_owned(), body.to_owned()]);
         }
-        // Nothing staged: commit everything, like "Stage all and commit".
         let mut steps = Vec::new();
-        if self.work.staged.is_empty() {
+        // A rebase stopped on conflicts finishes with `rebase --continue`, not a new commit.
+        if self.work.in_progress == Some(InProgress::Rebase) {
+            steps.push(vec!["rebase".to_owned(), "--continue".to_owned()]);
+            self.run_ops(
+                "Continue rebase",
+                steps,
+                Refresh::All,
+                OpKind::Normal(Undo::None, String::new()),
+                ctx,
+            );
+            return;
+        }
+        // Nothing staged: commit everything, like "Stage all and commit" (an amend with
+        // nothing staged only rewrites the message).
+        if self.work.staged.is_empty() && !self.amend {
             steps.push(vec!["add".to_owned(), "-A".to_owned()]);
         }
         steps.push(commit);
-        self.run_ops("Commit", steps, Refresh::All, ctx);
+        let label = if self.amend { "Amend" } else { "Commit" };
+        self.run_undoable(
+            label,
+            steps,
+            Refresh::All,
+            Undo::HeadMove { mode: "--soft" },
+            ctx,
+        );
     }
 
-    /// Drains finished background work.
+    fn stash_push(&mut self, message: &str, ctx: &egui::Context) {
+        let mut args = vec!["stash", "push", "--include-untracked"];
+        if !message.trim().is_empty() {
+            args.extend(["-m", message.trim()]);
+        }
+        let redo = ops(&[&args]);
+        self.run_undoable(
+            "Stash",
+            ops(&[&args]),
+            Refresh::All,
+            Undo::Custom {
+                undo: ops(&[&["stash", "pop", "--index"]]),
+                redo,
+            },
+            ctx,
+        );
+    }
+
+    fn undo(&mut self, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
+            return;
+        }
+        if let Some(entry) = self.undo_stack.pop() {
+            let label = format!("Undo {}", entry.label);
+            let steps = entry.undo.clone();
+            self.run_ops(&label, steps, Refresh::All, OpKind::Undo(entry), ctx);
+        }
+    }
+
+    fn redo(&mut self, ctx: &egui::Context) {
+        if self.busy_op.is_some() {
+            return;
+        }
+        if let Some(entry) = self.redo_stack.pop() {
+            let label = format!("Redo {}", entry.label);
+            let steps = entry.redo.clone();
+            self.run_ops(&label, steps, Refresh::All, OpKind::Redo(entry), ctx);
+        }
+    }
+
+    fn run_search(&mut self, ctx: &egui::Context) {
+        let query = self.search.query.trim().to_owned();
+        self.search.edited = None;
+        if query.is_empty() {
+            self.search.results.clear();
+            self.search.matches.clear();
+            self.search.searched.clear();
+            return;
+        }
+        self.search.running = true;
+        let path = self.path.clone();
+        spawn(&self.tx, ctx, move || {
+            let result = git::search(&path, &query);
+            Msg::Search(query, result)
+        });
+    }
+
+    fn search_step(&mut self, delta: i32, ctx: &egui::Context) {
+        let n = self.search.results.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.search.current as i32 + delta;
+        self.search.current = cur.rem_euclid(n as i32) as usize;
+        if let Some(hash) = self.search.results.get(self.search.current).cloned() {
+            self.goto(&hash, ctx);
+        }
+    }
+
+    fn start_terminal(
+        &mut self,
+        shell: Option<ShellSpec>,
+        cwd: Option<PathBuf>,
+        ctx: &egui::Context,
+    ) {
+        let shell = shell.unwrap_or_else(|| crate::terminal::default_shell(ctx));
+        let cwd = cwd.unwrap_or_else(|| self.path.clone());
+        match Terminal::spawn(&cwd, &shell, ctx) {
+            Ok(term) => {
+                self.terminals.push(term);
+                self.active_terminal = self.terminals.len() - 1;
+                self.terminal_error = None;
+                self.terminal_open = true;
+            }
+            Err(e) => {
+                self.terminal_error = Some(e);
+                self.terminal_open = true;
+            }
+        }
+    }
+
+    /// Drains finished background work and file-system events.
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
-            match msg {
-                Msg::Loaded(result) => {
-                    self.loading = false;
-                    match result {
-                        Ok(loaded) => {
-                            self.load_error = None;
-                            self.refs = loaded.refs;
-                            self.history = loaded.history;
-                            self.work = loaded.work;
-                            self.worktrees = loaded.worktrees;
-                            self.rebuild(ctx);
+            self.handle(msg, ctx);
+        }
+
+        // Changes on disk, debounced.
+        if let Some(rx) = &self.fs_rx {
+            while let Ok(git_dir) = rx.try_recv() {
+                let was = self.fs_pending.map(|(g, _)| g).unwrap_or(false);
+                self.fs_pending = Some((was || git_dir, Instant::now()));
+            }
+        }
+        if let Some((git_dir, at)) = self.fs_pending
+            && at.elapsed() > Duration::from_millis(400)
+            && !self.loading
+            && self.busy_op.is_none()
+        {
+            self.fs_pending = None;
+            if git_dir {
+                self.reload(ctx);
+            } else {
+                self.reload_status(ctx);
+            }
+        }
+
+        // Background fetch.
+        let minutes = Settings::get(ctx).auto_fetch_minutes;
+        if minutes > 0
+            && !self.remotes.is_empty()
+            && self.busy_op.is_none()
+            && self.last_fetch.elapsed() > Duration::from_secs(u64::from(minutes) * 60)
+        {
+            self.last_fetch = Instant::now();
+            self.run_ops_ex(
+                "Background fetch",
+                ops(&[&["fetch", "--all", "--prune", "--quiet"]]),
+                Refresh::All,
+                OpKind::Normal(Undo::None, String::new()),
+                true,
+                ctx,
+            );
+        }
+        if minutes > 0 {
+            ctx.request_repaint_after(Duration::from_secs(30));
+        }
+
+        // Debounced search while typing.
+        if let Some(at) = self.search.edited
+            && at.elapsed() > Duration::from_millis(350)
+        {
+            self.run_search(ctx);
+        } else if self.search.edited.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn handle(&mut self, msg: Msg, ctx: &egui::Context) {
+        match msg {
+            Msg::Loaded(result) => {
+                self.loading = false;
+                match result {
+                    Ok(loaded) => {
+                        self.load_error = None;
+                        self.refs = loaded.refs;
+                        self.has_more = loaded.history.len() >= loaded.requested;
+                        self.history = loaded.history;
+                        self.work = loaded.work;
+                        self.worktrees = loaded.worktrees;
+                        self.stashes = loaded.stashes;
+                        if self.stash_view.is_some_and(|i| i >= self.stashes.len()) {
+                            self.stash_view = None;
                         }
-                        Err(e) => self.load_error = Some(e),
+                        self.identity = loaded.identity;
+                        let forge = forge::detect(&loaded.remotes);
+                        self.remotes = loaded.remotes;
+                        if forge != self.forge {
+                            self.forge = forge;
+                            self.prs.clear();
+                            self.prs_loaded = None;
+                        }
+                        if self
+                            .prs_loaded
+                            .is_none_or(|t| t.elapsed() > Duration::from_secs(120))
+                        {
+                            self.load_prs(ctx);
+                        }
+                        self.rebuild(ctx);
                     }
+                    Err(e) => self.load_error = Some(e),
                 }
-                Msg::Status(result) => match result {
-                    Ok(work) => {
-                        self.work = work;
+            }
+            Msg::More(result) => {
+                self.loading_more = false;
+                match result {
+                    Ok(page) => {
+                        self.has_more = page.len() == git::LOG_PAGE;
+                        // A reload in between may have loaded these already.
+                        let known: HashSet<&str> =
+                            self.history.iter().map(|c| c.hash.as_str()).collect();
+                        let fresh: Vec<Commit> = page
+                            .into_iter()
+                            .filter(|c| !known.contains(c.hash.as_str()))
+                            .collect();
+                        self.history.extend(fresh);
                         self.rebuild(ctx);
                     }
                     Err(e) => self.status = Some((e, true)),
-                },
-                Msg::Detail(hash, result) => {
-                    if self.selected_hash().as_deref() == Some(hash.as_str()) {
-                        match result {
-                            Ok(d) => self.detail = Some(d),
-                            Err(e) => self.detail_error = Some(e),
-                        }
-                    }
                 }
-                Msg::Diff(key, result) => {
-                    if let Some(view) = &mut self.diff
-                        && view.key == key
-                    {
-                        view.lines = Some(result.map(|text| diff::parse(&text)));
-                    }
+            }
+            Msg::Status(result) => match result {
+                Ok(work) => {
+                    self.work = work;
+                    self.rebuild(ctx);
                 }
-                Msg::OpDone {
-                    label,
-                    result,
-                    refresh,
-                } => {
-                    self.busy_op = None;
+                Err(e) => self.status = Some((e, true)),
+            },
+            Msg::Detail(hash, result) => {
+                if self.detail_hash.as_deref() == Some(hash.as_str()) {
                     match result {
-                        Ok(_) => {
-                            if label == "Commit" {
-                                self.commit_summary.clear();
-                                self.commit_body.clear();
-                            }
-                            // Quiet success for staging, which happens all the time.
-                            if refresh == Refresh::All {
-                                self.status = Some((format!("{label}: done"), false));
+                        Ok(d) => self.detail = Some(d),
+                        Err(e) => self.detail_error = Some(e),
+                    }
+                }
+            }
+            Msg::Diff(key, result) => {
+                if let Some(view) = &mut self.diff
+                    && view.key == key
+                {
+                    view.data = Some(result);
+                }
+            }
+            Msg::Search(query, result) => {
+                if query == self.search.query.trim() {
+                    self.search.running = false;
+                    self.search.searched = query;
+                    match result {
+                        Ok(hashes) => {
+                            self.search.matches = hashes.iter().cloned().collect();
+                            self.search.results = hashes;
+                            self.search.current = 0;
+                            if let Some(first) = self.search.results.first().cloned() {
+                                self.goto(&first, ctx);
                             }
                         }
-                        Err(e) => {
-                            self.focus_wip = e.contains("CONFLICT");
-                            self.status = Some((format!("{label} failed: {e}"), true));
+                        Err(e) => self.status = Some((e, true)),
+                    }
+                }
+            }
+            Msg::Prs(result) => match result {
+                Ok(prs) => {
+                    self.prs = prs;
+                    self.pr_error = None;
+                }
+                Err(e) => self.pr_error = Some(e),
+            },
+            Msg::OpDone {
+                label,
+                result,
+                refresh,
+                kind,
+                quiet,
+            } => {
+                self.busy_op = None;
+                let long = self
+                    .op_started
+                    .take()
+                    .is_some_and(|t| t.elapsed() > LONG_OP);
+                match &result {
+                    Ok(_) => {
+                        if label == "Commit" || label == "Amend" || label == "Continue rebase" {
+                            self.commit_summary.clear();
+                            self.commit_body.clear();
+                            self.amend = false;
+                        }
+                        // Quiet success for staging, which happens all the time.
+                        if refresh == Refresh::All && !quiet {
+                            self.status = Some((format!("{label}: done"), false));
+                        }
+                        if label.contains("etch") {
+                            self.load_prs(ctx);
+                        }
+                        self.record_undo(&label, kind);
+                    }
+                    Err(e) => {
+                        self.focus_wip = e.contains("CONFLICT") || e.contains("could not apply");
+                        self.status = Some((format!("{label} failed: {e}"), true));
+                        // A failed undo stays undoable.
+                        match kind {
+                            OpKind::Undo(entry) => self.undo_stack.push(entry),
+                            OpKind::Redo(entry) => self.redo_stack.push(entry),
+                            OpKind::Normal(..) => {}
                         }
                     }
-                    match refresh {
-                        Refresh::Status => self.reload_status(ctx),
-                        Refresh::All => self.reload(ctx),
-                    }
+                }
+                if long && !quiet {
+                    self.finished = Some(match &result {
+                        Ok(_) => (format!("{} · {label}: done", self.name), false),
+                        Err(e) => (
+                            format!("{} · {label} failed: {}", self.name, headline(e)),
+                            true,
+                        ),
+                    });
+                }
+                match refresh {
+                    Refresh::Status => self.reload_status(ctx),
+                    Refresh::All => self.reload(ctx),
                 }
             }
         }
     }
 
-    fn apply(&mut self, action: Action, ctx: &egui::Context) {
+    fn record_undo(&mut self, label: &str, kind: OpKind) {
+        match kind {
+            OpKind::Normal(Undo::None, _) => {}
+            OpKind::Normal(Undo::HeadMove { mode }, heads) => {
+                let (before, after) = heads.split_once('\u{0}').unwrap_or(("", ""));
+                if before.is_empty() || after.is_empty() || before == after {
+                    return;
+                }
+                self.undo_stack.push(UndoEntry {
+                    label: label.to_owned(),
+                    undo: ops(&[&["reset", mode, before]]),
+                    redo: ops(&[&["reset", mode, after]]),
+                });
+                self.redo_stack.clear();
+            }
+            OpKind::Normal(Undo::Custom { undo, redo }, _) => {
+                self.undo_stack.push(UndoEntry {
+                    label: label.to_owned(),
+                    undo,
+                    redo,
+                });
+                self.redo_stack.clear();
+            }
+            OpKind::Undo(entry) => self.redo_stack.push(entry),
+            OpKind::Redo(entry) => self.undo_stack.push(entry),
+        }
+        // Plenty for a session.
+        if self.undo_stack.len() > 50 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    pub(crate) fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        let plain = OpKind::Normal(Undo::None, String::new());
         match action {
             Action::Select(row) => self.select(row, ctx),
-            Action::SelectHash(hash) => self.select_hash(&hash, ctx),
+            Action::SelectHash(hash) => self.goto(&hash, ctx),
+            Action::SelectStash(i) => self.select_stash(i, ctx),
             Action::OpenDiff(key) => self.open_diff(key, ctx),
-            Action::CloseDiff => self.diff = None,
+            Action::CloseDiff => {
+                self.diff = None;
+                self.conflict = None;
+            }
             Action::Ops {
                 label,
                 ops,
                 refresh,
-            } => self.run_ops(&label, ops, refresh, ctx),
-            Action::Checkout(name) => self.run_ops(
-                &format!("Checkout {name}"),
-                ops(&[&["checkout", &name]]),
-                Refresh::All,
-                ctx,
-            ),
+            } => self.run_ops(&label, ops, refresh, plain, ctx),
+            Action::UndoableOps {
+                label,
+                ops,
+                refresh,
+                undo,
+            } => self.run_undoable(&label, ops, refresh, undo, ctx),
+            Action::Checkout(name) => self.checkout(&name, ctx),
             Action::CheckoutRemote(name) => self.checkout_remote(&name, ctx),
             Action::Dialog(dialog) => self.dialog = Some(dialog),
             Action::Commit => self.commit(ctx),
-            Action::Fetch => self.run_ops(
-                "Fetch",
-                ops(&[&["fetch", "--all", "--prune"]]),
+            Action::Fetch => {
+                self.last_fetch = Instant::now();
+                self.run_ops(
+                    "Fetch",
+                    ops(&[&["fetch", "--all", "--prune"]]),
+                    Refresh::All,
+                    plain,
+                    ctx,
+                )
+            }
+            Action::Pull => self.run_undoable(
+                "Pull",
+                ops(&[&["pull", "--ff-only"]]),
                 Refresh::All,
+                Undo::HeadMove { mode: "--keep" },
                 ctx,
             ),
-            Action::Pull => self.run_ops("Pull", ops(&[&["pull", "--ff-only"]]), Refresh::All, ctx),
             Action::Push => self.push(ctx),
             Action::Reload => self.reload(ctx),
+            Action::LoadMore => self.load_more(ctx),
+            Action::Undo => self.undo(ctx),
+            Action::Redo => self.redo(ctx),
+            Action::StashPush(message) => self.stash_push(&message, ctx),
             Action::OpenTab(path) => self.open_request = Some(path),
             Action::ToggleTerminal => {
                 self.terminal_open = !self.terminal_open;
-                if self.terminal_open && self.terminal.is_none() {
-                    self.start_terminal(ctx);
+                if self.terminal_open && self.terminals.is_empty() {
+                    self.start_terminal(None, None, ctx);
                 }
             }
-            Action::RestartTerminal => {
-                self.terminal = None;
-                self.start_terminal(ctx);
+            Action::NewTerminal { shell, cwd } => self.start_terminal(shell, cwd, ctx),
+            Action::CloseTerminal(i) => {
+                if i < self.terminals.len() {
+                    self.terminals.remove(i);
+                }
+                self.active_terminal = self
+                    .active_terminal
+                    .min(self.terminals.len().saturating_sub(1));
+                if self.terminals.is_empty() {
+                    self.terminal_open = false;
+                }
+            }
+            Action::SelectTerminal(i) => self.active_terminal = i,
+            Action::ToggleSearch => {
+                self.search.open = !self.search.open;
+                self.search.focus = self.search.open;
+                if !self.search.open {
+                    self.search.matches.clear();
+                    self.search.results.clear();
+                    self.search.searched.clear();
+                }
+            }
+            Action::SearchStep(d) => self.search_step(d, ctx),
+            Action::CreatePr {
+                branch,
+                base,
+                title,
+                body,
+                draft,
+            } => {
+                let Some(forge) = self.forge else { return };
+                if self.busy_op.is_some() {
+                    return;
+                }
+                let label = format!("Create {}", forge.noun());
+                self.busy_op = Some(label.clone());
+                self.op_started = Some(Instant::now());
+                let path = self.path.clone();
+                spawn(&self.tx, ctx, move || {
+                    // Publish the branch first, so the forge can see it.
+                    let pushed = git::run(Some(&path), &["push", "-u", "origin", &branch]);
+                    let result = pushed.and_then(|_| {
+                        forge::create(&path, forge, &branch, &base, &title, &body, draft)
+                    });
+                    Msg::OpDone {
+                        label,
+                        result,
+                        refresh: Refresh::All,
+                        kind: OpKind::Normal(Undo::None, String::new()),
+                        quiet: false,
+                    }
+                });
+            }
+            Action::OpenUrl(url) => {
+                let _ = open::that_detached(url);
+            }
+            Action::OpenPath(rel) => {
+                let _ = open::that_detached(self.path.join(rel));
+            }
+            Action::OpenInEditor(rel) => {
+                let editor = Settings::get(ctx).editor;
+                if let Err(e) = open_in_editor(&editor, &self.path.join(rel)) {
+                    self.status = Some((e, true));
+                }
+            }
+            Action::SetIdentity(name, email) => self.run_ops(
+                "Set identity",
+                ops(&[
+                    &["config", "--local", "user.name", &name],
+                    &["config", "--local", "user.email", &email],
+                ]),
+                Refresh::All,
+                plain,
+                ctx,
+            ),
+            Action::SetDiffOptions { split, ignore_ws } => {
+                self.diff_split = split;
+                if ignore_ws != self.diff_ignore_ws {
+                    self.diff_ignore_ws = ignore_ws;
+                    self.reopen_diff(ctx);
+                }
+            }
+            Action::SaveConflict => {
+                if let Some(editor) = &self.conflict {
+                    match editor.save(&self.path) {
+                        Ok(()) => {
+                            let file = editor.path.clone();
+                            self.run_ops(
+                                "Mark resolved",
+                                ops(&[&["add", "--", &file]]),
+                                Refresh::Status,
+                                plain,
+                                ctx,
+                            );
+                        }
+                        Err(e) => self.status = Some((e, true)),
+                    }
+                }
             }
         }
     }
@@ -593,14 +1380,37 @@ impl RepoTab {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         let t = Tokens::get(&ctx);
-        let mut acts = Vec::new();
+        let mut acts: Vec<Action> = std::mem::take(&mut self.queued);
 
-        if self.diff.is_some()
-            && self.dialog.is_none()
-            && !ctx.egui_wants_keyboard_input()
-            && ctx.input(|i| i.key_pressed(Key::Escape))
-        {
-            acts.push(Action::CloseDiff);
+        let free_keys =
+            self.dialog.is_none() && !self.keys_blocked && !ctx.egui_wants_keyboard_input();
+        if free_keys {
+            let (esc, undo, redo, find) = ctx.input(|i| {
+                (
+                    i.key_pressed(Key::Escape),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(Key::Z),
+                    i.modifiers.command
+                        && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
+                    i.modifiers.command && i.key_pressed(Key::F),
+                )
+            });
+            if esc && self.diff.is_some() {
+                acts.push(Action::CloseDiff);
+            } else if esc && self.search.open {
+                acts.push(Action::ToggleSearch);
+            }
+            if undo {
+                acts.push(Action::Undo);
+            }
+            if redo {
+                acts.push(Action::Redo);
+            }
+            if find {
+                self.search.open = true;
+                self.search.focus = true;
+            }
+        } else if self.search.open && ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F)) {
+            self.search.focus = true;
         }
 
         egui::Panel::top("repo_toolbar")
@@ -614,7 +1424,7 @@ impl RepoTab {
         let side = egui::Frame::new().fill(t.card);
         egui::Panel::left("repo_branches")
             .resizable(true)
-            .default_size(260.0)
+            .default_size(270.0)
             .size_range(170.0..=520.0)
             .frame(side)
             .show(ui, |ui| self.sidebar(ui, &mut acts));
@@ -635,7 +1445,9 @@ impl RepoTab {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.dock))
             .show(ui, |ui| {
-                if self.diff.is_some() {
+                if self.conflict.is_some() {
+                    self.conflict_view(ui, &mut acts);
+                } else if self.diff.is_some() {
                     self.diff_view(ui, &mut acts);
                 } else {
                     self.graph_view(ui, &mut acts);
@@ -653,20 +1465,69 @@ impl RepoTab {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let idle = self.busy_op.is_none();
-            let has_remote = !self.refs.remotes.is_empty();
+
+            let undo_tip = match self.undo_stack.last() {
+                Some(e) => format!("Undo {} (Ctrl+Z)", e.label),
+                None => "Nothing to undo".to_owned(),
+            };
+            if icons::tool_button(ui, "undo-2", "", idle && !self.undo_stack.is_empty())
+                .on_hover_text(undo_tip)
+                .on_disabled_hover_text("Nothing to undo")
+                .clicked()
+            {
+                acts.push(Action::Undo);
+            }
+            let redo_tip = match self.redo_stack.last() {
+                Some(e) => format!("Redo {} (Ctrl+Y)", e.label),
+                None => "Nothing to redo".to_owned(),
+            };
+            if icons::tool_button(ui, "redo-2", "", idle && !self.redo_stack.is_empty())
+                .on_hover_text(redo_tip)
+                .on_disabled_hover_text("Nothing to redo")
+                .clicked()
+            {
+                acts.push(Action::Redo);
+            }
+            widgets::toolbar_separator(ui);
+
+            let has_remote = !self.remotes.is_empty();
+            let fetched = format!(
+                "Fetch all remotes (git fetch --all --prune)\nLast fetched {} ago",
+                short_duration(self.last_fetch.elapsed())
+            );
             if icons::tool_button(ui, "cloud-download", "Fetch", idle && has_remote)
-                .on_hover_text("Fetch all remotes (git fetch --all --prune)")
+                .on_hover_text(fetched)
                 .clicked()
             {
                 acts.push(Action::Fetch);
             }
-            if icons::tool_button(ui, "arrow-down-to-line", "Pull", idle && has_remote)
-                .on_hover_text("Fast-forward the current branch (git pull --ff-only)")
-                .clicked()
-            {
+            let (ahead, behind) = self
+                .refs
+                .current
+                .as_ref()
+                .and_then(|c| self.refs.local.iter().find(|b| &b.name == c))
+                .map(|b| b.ahead_behind())
+                .unwrap_or((0, 0));
+            let pull_label = if behind > 0 {
+                format!("Pull {behind}")
+            } else {
+                "Pull".to_owned()
+            };
+            let pull =
+                icons::tool_button(ui, "arrow-down-to-line", &pull_label, idle && has_remote)
+                    .on_hover_text("Fast-forward the current branch (git pull --ff-only)");
+            if behind > 0 {
+                widgets::count_badge(ui, pull.rect, t.accent);
+            }
+            if pull.clicked() {
                 acts.push(Action::Pull);
             }
-            if icons::tool_button(ui, "arrow-up-from-line", "Push", idle && has_remote)
+            let push_label = if ahead > 0 {
+                format!("Push {ahead}")
+            } else {
+                "Push".to_owned()
+            };
+            if icons::tool_button(ui, "arrow-up-from-line", &push_label, idle && has_remote)
                 .on_hover_text("Push the current branch (publishes it if it has no upstream yet)")
                 .clicked()
             {
@@ -680,20 +1541,42 @@ impl RepoTab {
             {
                 acts.push(Action::Dialog(Dialog::create_branch(&head, "HEAD")));
             }
+            if icons::tool_button(ui, "archive", "Stash", idle && !self.work.is_clean())
+                .on_hover_text("Stash all changes, untracked files included")
+                .on_disabled_hover_text("No changes to stash")
+                .clicked()
+            {
+                acts.push(Action::Dialog(Dialog::stash()));
+            }
             let terminal = icons::tool_button(ui, "square-terminal", "Terminal", true)
                 .on_hover_text("Terminal in the repository folder");
             if self.terminal_open {
-                ui.painter().line_segment(
-                    [
-                        terminal.rect.left_bottom() + egui::vec2(6.0, -1.0),
-                        terminal.rect.right_bottom() + egui::vec2(-6.0, -1.0),
-                    ],
-                    egui::Stroke::new(2.0, t.accent),
-                );
+                widgets::active_underline(ui, terminal.rect, t.accent);
             }
             if terminal.clicked() {
                 acts.push(Action::ToggleTerminal);
             }
+            let search =
+                icons::tool_button(ui, "search", "", true).on_hover_text("Search commits (Ctrl+F)");
+            if self.search.open {
+                widgets::active_underline(ui, search.rect, t.accent);
+            }
+            if search.clicked() {
+                acts.push(Action::ToggleSearch);
+            }
+            let open =
+                icons::tool_button(ui, "external-link", "", true).on_hover_text("Open the folder…");
+            egui::Popup::menu(&open).show(|ui| {
+                if ui.button(reveal_label()).clicked() {
+                    acts.push(Action::OpenPath(PathBuf::new()));
+                }
+                if ui.button("Open in editor").clicked() {
+                    acts.push(Action::OpenInEditor(PathBuf::new()));
+                }
+                if ui.button("Copy path").clicked() {
+                    ui.ctx().copy_text(self.path.display().to_string());
+                }
+            });
             widgets::toolbar_separator(ui);
             if icons::tool_button(ui, "refresh-cw", "", !self.loading)
                 .on_hover_text("Reload (F5)")
@@ -754,56 +1637,146 @@ impl RepoTab {
             });
         });
     }
-}
 
-impl RepoTab {
-    fn start_terminal(&mut self, ctx: &egui::Context) {
-        match Terminal::spawn(&self.path, ctx) {
-            Ok(term) => {
-                self.terminal = Some(term);
-                self.terminal_error = None;
-            }
-            Err(e) => self.terminal_error = Some(e),
-        }
-    }
-
-    /// The bottom panel: a header strip and the shell.
+    /// The bottom panel: terminal tabs and the active shell.
     fn terminal_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
-        let title = match &self.terminal {
-            Some(term) => format!("Terminal · {}", term.shell),
-            None => "Terminal".to_owned(),
-        };
-        widgets::panel_header(ui, &title, |ui| {
-            if icons::small_button(ui, "x", "Close the panel (the shell keeps running)").clicked() {
-                acts.push(Action::ToggleTerminal);
-            }
-            if icons::small_button(ui, "refresh-cw", "Restart the shell").clicked() {
-                acts.push(Action::RestartTerminal);
-            }
-        });
+        widgets::terminal_tabs(ui, &self.terminals, self.active_terminal, acts);
         if let Some(err) = &self.terminal_error {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
                 ui.colored_label(t.danger, err);
             });
-            return;
+            if self.terminals.is_empty() {
+                return;
+            }
         }
-        let Some(term) = &mut self.terminal else {
+        let i = self.active_terminal;
+        let Some(term) = self.terminals.get_mut(i) else {
             return;
         };
         if term.has_exited() {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new("The shell has exited.").color(t.text_dim));
-                if ui.button("Start a new one").clicked() {
-                    acts.push(Action::RestartTerminal);
+                if ui.button("Close").clicked() {
+                    acts.push(Action::CloseTerminal(i));
                 }
             });
             return;
         }
         term.ui(ui);
+    }
+
+    /// What the command palette offers for this repository.
+    pub(crate) fn palette_items(&self) -> Vec<(String, String, Action)> {
+        let mut items: Vec<(String, String, Action)> = vec![
+            ("Fetch".into(), "remote".into(), Action::Fetch),
+            ("Pull".into(), "remote".into(), Action::Pull),
+            ("Push".into(), "remote".into(), Action::Push),
+            ("Undo".into(), "Ctrl+Z".into(), Action::Undo),
+            ("Redo".into(), "Ctrl+Y".into(), Action::Redo),
+            (
+                "Stash changes".into(),
+                "stash".into(),
+                Action::Dialog(Dialog::stash()),
+            ),
+            (
+                "Search commits".into(),
+                "Ctrl+F".into(),
+                Action::ToggleSearch,
+            ),
+            (
+                "Toggle terminal".into(),
+                "terminal".into(),
+                Action::ToggleTerminal,
+            ),
+            (
+                "New terminal".into(),
+                "terminal".into(),
+                Action::NewTerminal {
+                    shell: None,
+                    cwd: None,
+                },
+            ),
+            ("Reload".into(), "F5".into(), Action::Reload),
+            (
+                reveal_label().into(),
+                "folder".into(),
+                Action::OpenPath(PathBuf::new()),
+            ),
+            (
+                "Open in editor".into(),
+                "folder".into(),
+                Action::OpenInEditor(PathBuf::new()),
+            ),
+        ];
+        if !self.refs.head.is_empty() {
+            items.push((
+                "Create branch".into(),
+                "branch".into(),
+                Action::Dialog(Dialog::create_branch(&self.refs.head, "HEAD")),
+            ));
+            items.push((
+                "Create tag".into(),
+                "tag".into(),
+                Action::Dialog(Dialog::tag(&self.refs.head, "HEAD", self.default_remote())),
+            ));
+        }
+        for b in &self.refs.local {
+            if !b.is_head {
+                items.push((
+                    format!("Check out {}", b.name),
+                    "branch".into(),
+                    Action::Checkout(b.name.clone()),
+                ));
+            }
+        }
+        if let Some(current) = &self.refs.current {
+            for b in &self.refs.local {
+                if !b.is_head {
+                    items.push((
+                        format!("Merge {} into {current}", b.name),
+                        "merge".into(),
+                        merge_action(&b.name, current),
+                    ));
+                    items.push((
+                        format!("Rebase {current} onto {}", b.name),
+                        "rebase".into(),
+                        rebase_action(&b.name, current),
+                    ));
+                }
+            }
+        }
+        for (remote, branches) in &self.refs.remotes {
+            for b in branches {
+                items.push((
+                    format!("Check out {}", b.name),
+                    remote.clone(),
+                    Action::CheckoutRemote(b.name.clone()),
+                ));
+            }
+        }
+        items
+    }
+}
+
+pub(crate) fn merge_action(branch: &str, current: &str) -> Action {
+    Action::UndoableOps {
+        label: format!("Merge {branch} into {current}"),
+        ops: ops(&[&["merge", "--no-edit", branch]]),
+        refresh: Refresh::All,
+        undo: Undo::HeadMove { mode: "--keep" },
+    }
+}
+
+pub(crate) fn rebase_action(onto: &str, current: &str) -> Action {
+    Action::UndoableOps {
+        label: format!("Rebase {current} onto {onto}"),
+        ops: ops(&[&["rebase", onto]]),
+        refresh: Refresh::All,
+        undo: Undo::HeadMove { mode: "--keep" },
     }
 }
 
@@ -812,6 +1785,52 @@ fn abort_action(state: InProgress) -> Action {
         label: format!("Abort {}", state.label().to_lowercase()),
         ops: ops(&[&[state.command(), "--abort"]]),
         refresh: Refresh::All,
+    }
+}
+
+pub(crate) fn reveal_label() -> &'static str {
+    if cfg!(windows) {
+        "Show in Explorer"
+    } else if cfg!(target_os = "macos") {
+        "Show in Finder"
+    } else {
+        "Open folder"
+    }
+}
+
+/// Runs the user's editor command with `path` (through `cmd` on Windows, where editors are
+/// usually `.cmd` scripts).
+pub(crate) fn open_in_editor(editor: &str, path: &Path) -> Result<(), String> {
+    let editor = if editor.trim().is_empty() {
+        "code"
+    } else {
+        editor.trim()
+    };
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(editor).arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new(editor);
+        c.arg(path);
+        c
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not run {editor}: {e}"))
+}
+
+fn short_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s / 60),
+        _ => format!("{} h", s / 3600),
     }
 }
 
@@ -852,7 +1871,6 @@ fn spawn(tx: &Sender<Msg>, ctx: &egui::Context, job: impl FnOnce() -> Msg + Send
         ctx.request_repaint();
     });
 }
-pub use widgets::primary_button;
 
 #[cfg(test)]
 mod tests {

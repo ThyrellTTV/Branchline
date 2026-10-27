@@ -1,4 +1,5 @@
-//! Central pane: the commit graph of every branch.
+//! Central pane: the commit graph of every branch, with branch pills on the left, search and
+//! older history loaded as you scroll.
 
 use egui::{
     Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, Response, Sense, Stroke, Ui,
@@ -6,9 +7,10 @@ use egui::{
 };
 
 use super::widgets;
-use super::{Action, Dialog, Refresh, RepoTab, WIP_HASH, ops};
-use crate::git::Refs;
+use super::{Action, Dialog, Refresh, RepoTab, Undo, WIP_HASH, ops};
+use crate::git::{self, Refs};
 use crate::icons;
+use crate::settings::Settings;
 use crate::theme::{self, Tokens};
 
 const ROW_H: f32 = 28.0;
@@ -16,13 +18,32 @@ const LANE_W: f32 = 16.0;
 const MAX_LANES_SHOWN: usize = 24;
 const AUTHOR_W: f32 = 150.0;
 const DATE_W: f32 = 118.0;
-/// Width of the branch/tag column left of the graph.
-const REFS_W: f32 = 210.0;
+const HASH_W: f32 = 70.0;
 const AVATAR_D: f32 = 20.0;
+
+/// Column widths for this frame (from the settings).
+#[derive(Clone, Copy)]
+struct Cols {
+    refs: f32,
+    graph: f32,
+    hash: f32,
+    author: f32,
+    date: f32,
+}
+
+impl Cols {
+    /// Width of everything right of the description.
+    fn trailing(&self) -> f32 {
+        self.hash + self.author + self.date
+    }
+}
 
 impl RepoTab {
     pub(super) fn graph_view(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let t = Tokens::get(ui.ctx());
+        if self.search.open {
+            self.search_bar(ui, acts);
+        }
         if let Some(err) = &self.load_error {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -63,8 +84,15 @@ impl RepoTab {
             }
         }
 
+        let settings = Settings::get(ui.ctx());
         let lanes = self.graph.width.clamp(1, MAX_LANES_SHOWN);
-        let graph_w = (lanes as f32 * LANE_W + 12.0).max(60.0);
+        let cols = Cols {
+            refs: settings.refs_width.clamp(150.0, 600.0),
+            graph: (lanes as f32 * LANE_W + 12.0).max(60.0),
+            hash: if settings.show_hash { HASH_W } else { 0.0 },
+            author: if settings.show_author { AUTHOR_W } else { 0.0 },
+            date: if settings.show_date { DATE_W } else { 0.0 },
+        };
 
         // Column headers.
         let (header, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
@@ -77,13 +105,22 @@ impl RepoTab {
             );
             let y = header.center().y;
             let font = theme::semibold(10.5);
-            for (x, label) in [
+            let right = header.right();
+            let mut labels = vec![
                 (header.left() + 10.0, "BRANCH / TAG"),
-                (header.left() + REFS_W + 10.0, "GRAPH"),
-                (header.left() + REFS_W + graph_w + 6.0, "DESCRIPTION"),
-                (header.right() - DATE_W - AUTHOR_W, "AUTHOR"),
-                (header.right() - DATE_W, "DATE"),
-            ] {
+                (header.left() + cols.refs + 10.0, "GRAPH"),
+                (header.left() + cols.refs + cols.graph + 6.0, "DESCRIPTION"),
+            ];
+            if cols.hash > 0.0 {
+                labels.push((right - cols.trailing(), "COMMIT"));
+            }
+            if cols.author > 0.0 {
+                labels.push((right - cols.author - cols.date, "AUTHOR"));
+            }
+            if cols.date > 0.0 {
+                labels.push((right - cols.date, "DATE"));
+            }
+            for (x, label) in labels {
                 p.text(
                     pos2(x, y),
                     Align2::LEFT_CENTER,
@@ -111,9 +148,27 @@ impl RepoTab {
         // `show_rows` sizes rows as ROW_H + item spacing, so the spacing must be zero here.
         ui.spacing_mut().item_spacing.y = 0.0;
         let idle = self.busy_op.is_none();
-        let out = scroll.show_rows(ui, ROW_H, self.commits.len(), |ui, range| {
+        let now = git::now();
+        let total = self.commits.len() + usize::from(self.has_more);
+        let out = scroll.show_rows(ui, ROW_H, total, |ui, range| {
+            // Near the end: fetch the next page of history.
+            if range.end + 40 >= self.commits.len() && self.has_more && !self.loading_more {
+                acts.push(Action::LoadMore);
+            }
             for i in range {
-                let resp = self.commit_row(ui, i, graph_w, lanes);
+                if i >= self.commits.len() {
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Loading older commits…",
+                        FontId::proportional(12.0),
+                        t.text_faint,
+                    );
+                    continue;
+                }
+                let resp = self.commit_row(ui, i, cols, lanes, now);
                 if resp.clicked() {
                     acts.push(Action::Select(i));
                 }
@@ -132,64 +187,183 @@ impl RepoTab {
                                 refresh: Refresh::Status,
                             });
                         }
+                        if ui
+                            .add_enabled(idle, egui::Button::new("Stash changes…"))
+                            .clicked()
+                        {
+                            acts.push(Action::Dialog(Dialog::stash()));
+                        }
                     });
                     continue;
                 }
-                let hash = commit.hash.clone();
-                let short = hash.get(..8).unwrap_or(&hash).to_owned();
-                let summary = commit.summary.clone();
-                let is_head = hash == self.refs.head;
-                resp.context_menu(|ui| {
-                    if ui.button("Create branch here…").clicked() {
-                        acts.push(Action::Dialog(Dialog::create_branch(&hash, &short)));
-                    }
-                    if ui
-                        .add_enabled(
-                            idle && !is_head,
-                            egui::Button::new("Check out this commit (detached)"),
-                        )
-                        .clicked()
-                    {
-                        acts.push(Action::Checkout(hash.clone()));
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            idle && !is_head,
-                            egui::Button::new("Cherry-pick onto current branch"),
-                        )
-                        .clicked()
-                    {
-                        acts.push(Action::Ops {
-                            label: format!("Cherry-pick {short}"),
-                            ops: ops(&[&["cherry-pick", &hash]]),
-                            refresh: Refresh::All,
-                        });
-                    }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Revert commit"))
-                        .clicked()
-                    {
-                        acts.push(Action::Ops {
-                            label: format!("Revert {short}"),
-                            ops: ops(&[&["revert", "--no-edit", &hash]]),
-                            refresh: Refresh::All,
-                        });
-                    }
-                    ui.separator();
-                    if ui.button("Copy commit hash").clicked() {
-                        ui.ctx().copy_text(hash.clone());
-                    }
-                    if ui.button("Copy message").clicked() {
-                        ui.ctx().copy_text(summary.clone());
-                    }
-                });
+                self.commit_menu(&resp, i, idle, acts);
             }
         });
         ui.data_mut(|d| d.insert_temp(offset_id, out.state.offset.y));
     }
 
-    fn commit_row(&self, ui: &mut Ui, i: usize, graph_w: f32, lanes: usize) -> Response {
+    /// Right-click menu of a commit row.
+    fn commit_menu(&self, resp: &Response, i: usize, idle: bool, acts: &mut Vec<Action>) {
+        let Some(commit) = self.commits.get(i) else {
+            return;
+        };
+        let hash = commit.hash.clone();
+        let short = hash.get(..8).unwrap_or(&hash).to_owned();
+        let summary = commit.summary.clone();
+        let is_head = hash == self.refs.head;
+        // Local branches pointing here get their own submenu.
+        let here: Vec<&git::Branch> = self
+            .refs
+            .local
+            .iter()
+            .filter(|b| b.target == hash)
+            .collect();
+        resp.context_menu(|ui| {
+            for b in &here {
+                ui.menu_button(format!("Branch {}", b.name), |ui| {
+                    self.branch_menu_items(ui, acts, b, idle);
+                });
+            }
+            if !here.is_empty() {
+                ui.separator();
+            }
+            if ui.button("Create branch here…").clicked() {
+                acts.push(Action::Dialog(Dialog::create_branch(&hash, &short)));
+            }
+            if ui.button("Create tag here…").clicked() {
+                acts.push(Action::Dialog(Dialog::tag(&hash, &short, self.default_remote())));
+            }
+            if ui
+                .add_enabled(
+                    idle && !is_head,
+                    egui::Button::new("Check out this commit (detached)"),
+                )
+                .clicked()
+            {
+                acts.push(Action::Checkout(hash.clone()));
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    idle && !is_head,
+                    egui::Button::new("Cherry-pick onto current branch"),
+                )
+                .clicked()
+            {
+                acts.push(Action::UndoableOps {
+                    label: format!("Cherry-pick {short}"),
+                    ops: ops(&[&["cherry-pick", &hash]]),
+                    refresh: Refresh::All,
+                    undo: Undo::HeadMove { mode: "--keep" },
+                });
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Revert commit"))
+                .clicked()
+            {
+                acts.push(Action::UndoableOps {
+                    label: format!("Revert {short}"),
+                    ops: ops(&[&["revert", "--no-edit", &hash]]),
+                    refresh: Refresh::All,
+                    undo: Undo::HeadMove { mode: "--keep" },
+                });
+            }
+            let target = self.refs.current.clone().unwrap_or_else(|| "HEAD".to_owned());
+            ui.add_enabled_ui(idle && !is_head, |ui| {
+                ui.menu_button(format!("Reset {target} to here"), |ui| {
+                    for (mode, undo_mode, label, explain) in [
+                        ("--soft", "--soft", "Soft", "Keeps every change, staged."),
+                        ("--mixed", "--mixed", "Mixed", "Keeps every change, unstaged."),
+                        ("--hard", "--keep", "Hard", "Throws away uncommitted changes and the commits after this one. Uncommitted work can't be recovered."),
+                    ] {
+                        if ui.button(format!("{label} — {}", explain.split('.').next().unwrap_or(explain))).clicked() {
+                            acts.push(Action::Dialog(
+                                Dialog::confirm(
+                                    &format!("{label} reset"),
+                                    format!("Move {target} to {short} ({summary})? {explain}"),
+                                    &format!("Reset {}", label.to_lowercase()),
+                                    ops(&[&["reset", mode, &hash]]),
+                                    None,
+                                )
+                                .undo(Undo::HeadMove { mode: undo_mode }),
+                            ));
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            if ui.button("Copy commit hash").clicked() {
+                ui.ctx().copy_text(hash.clone());
+            }
+            if ui.button("Copy message").clicked() {
+                ui.ctx().copy_text(summary.clone());
+            }
+        });
+    }
+
+    fn search_bar(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        let t = Tokens::get(ui.ctx());
+        egui::Frame::new()
+            .fill(t.chrome)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .stroke(Stroke::new(1.0, t.separator))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    icons::inline(ui, "search", 15.0, t.text_faint);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.search.query)
+                            .hint_text("Search messages, authors and hashes in all history")
+                            .desired_width(ui.available_width() - 190.0)
+                            .margin(egui::Margin::symmetric(8, 4)),
+                    );
+                    if std::mem::take(&mut self.search.focus) {
+                        edit.request_focus();
+                    }
+                    if edit.changed() {
+                        self.search.edited = Some(std::time::Instant::now());
+                    }
+                    let (enter, shift, esc) = ui.input(|i| {
+                        (
+                            i.key_pressed(Key::Enter),
+                            i.modifiers.shift,
+                            i.key_pressed(Key::Escape),
+                        )
+                    });
+                    if edit.lost_focus() && enter {
+                        acts.push(Action::SearchStep(if shift { -1 } else { 1 }));
+                        edit.request_focus();
+                    }
+                    if edit.has_focus() && esc {
+                        acts.push(Action::ToggleSearch);
+                    }
+                    let n = self.search.results.len();
+                    let summary = if self.search.running {
+                        "searching…".to_owned()
+                    } else if self.search.searched.is_empty() {
+                        String::new()
+                    } else if n == 0 {
+                        "no results".to_owned()
+                    } else {
+                        format!("{} of {n}", self.search.current + 1)
+                    };
+                    ui.label(egui::RichText::new(summary).color(t.text_dim).small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::small_button(ui, "x", "Close (Esc)").clicked() {
+                            acts.push(Action::ToggleSearch);
+                        }
+                        if icons::small_button(ui, "chevron-down", "Next (Enter)").clicked() {
+                            acts.push(Action::SearchStep(1));
+                        }
+                        if icons::small_button(ui, "chevron-up", "Previous (Shift+Enter)").clicked()
+                        {
+                            acts.push(Action::SearchStep(-1));
+                        }
+                    });
+                });
+            });
+    }
+
+    fn commit_row(&self, ui: &mut Ui, i: usize, cols: Cols, lanes: usize, now: i64) -> Response {
         let t = Tokens::get(ui.ctx());
         let (rect, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
@@ -198,15 +372,25 @@ impl RepoTab {
         };
         let painter = ui.painter_at(rect);
         let is_wip = commit.hash == WIP_HASH;
+        let is_match = self.search.matches.contains(&commit.hash);
 
         if self.selected == Some(i) {
             painter.rect_filled(rect, 0.0, t.row_selected);
         } else if resp.hovered() {
             painter.rect_filled(rect, 0.0, t.hover);
+        } else if is_match {
+            painter.rect_filled(rect, 0.0, t.warning.gamma_multiply(0.10));
+        }
+        if is_match {
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2(3.0, ROW_H)),
+                0.0,
+                t.warning,
+            );
         }
 
         let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
-        let gx = rect.left() + REFS_W;
+        let gx = rect.left() + cols.refs;
         let x = |lane: usize| gx + 6.0 + lane as f32 * LANE_W + LANE_W / 2.0;
         let row_color = self
             .graph
@@ -216,22 +400,29 @@ impl RepoTab {
             .unwrap_or(t.text_faint);
         let node_x = self.graph.rows.get(i).map(|r| x(r.col));
 
-        // Branch and tag pills, left of the graph, joined to the commit's dot.
+        // Branch and tag pills, left of the graph, joined to the commit's dot, with the tip's
+        // author and how long ago it was made.
         let badges = badges(&commit.refs, &self.refs);
         let mut resp = resp;
         if let (Some(first), Some(node_x)) = (badges.first(), node_x) {
             let refs_clip = Rect::from_min_max(rect.min, pos2(gx - 4.0, bottom));
             let rp = painter.with_clip_rect(refs_clip);
+            let when = git::relative_time(commit.time, now);
+            let when_galley = rp.layout_no_wrap(when, theme::medium(10.5), t.text_dim);
+            let when_w = when_galley.size().x + 12.0;
             let more = badges.len() - 1;
             let more_w = if more > 0 { 28.0 } else { 0.0 };
-            let max_w = REFS_W - 10.0 - AVATAR_D - 8.0 - more_w - 8.0;
+            let max_w = cols.refs - 10.0 - AVATAR_D - 8.0 - more_w - when_w - 14.0;
+            let has_pr =
+                first.kind == BadgeKind::Branch && self.prs.iter().any(|p| p.branch == first.label);
             let pill = ref_pill(
                 ui,
                 &rp,
                 pos2(rect.left() + 8.0, mid),
                 first,
                 row_color,
-                max_w,
+                max_w.max(40.0),
+                has_pr,
             );
             let mut end = pill.right();
             if more > 0 {
@@ -250,21 +441,37 @@ impl RepoTab {
                 );
                 end = r.right();
             }
-            // Avatar of whoever made the tip commit.
             let avatar = pos2(end + 5.0 + AVATAR_D / 2.0, mid);
+            let when_rect = Rect::from_min_size(
+                pos2(avatar.x + AVATAR_D / 2.0 + 5.0, mid - 9.0),
+                vec2(when_w, 18.0),
+            );
             // Connector to the dot, drawn first so the lanes cross over it.
             painter.line_segment(
-                [pos2(avatar.x, mid), pos2(node_x, mid)],
+                [pos2(when_rect.right(), mid), pos2(node_x, mid)],
                 Stroke::new(1.5, row_color.gamma_multiply(0.8)),
             );
-            widgets::avatar(&rp, avatar, AVATAR_D / 2.0, &commit.author);
+            widgets::avatar(ui, avatar, AVATAR_D / 2.0, &commit.author, &commit.email);
+            rp.rect_filled(when_rect, CornerRadius::same(9), t.field);
+            rp.rect_stroke(
+                when_rect,
+                CornerRadius::same(9),
+                Stroke::new(1.0, row_color.gamma_multiply(0.6)),
+                egui::StrokeKind::Inside,
+            );
+            rp.galley(
+                pos2(when_rect.left() + 6.0, mid - when_galley.size().y / 2.0),
+                when_galley,
+                t.text_dim,
+            );
             let refs_cell = Rect::from_min_max(rect.min, pos2(gx, bottom));
             if ui.rect_contains_pointer(refs_cell) {
                 let lines: Vec<String> = badges.iter().map(Badge::describe).collect();
                 resp = resp.on_hover_text(format!(
-                    "{}\nTip commit by {}",
+                    "{}\nTip commit by {} · {}",
                     lines.join("\n"),
-                    commit.author
+                    commit.author,
+                    commit.date
                 ));
             }
         }
@@ -272,7 +479,7 @@ impl RepoTab {
         // Graph.
         if let Some(row) = self.graph.rows.get(i) {
             let gp = painter.with_clip_rect(
-                rect.intersect(Rect::from_min_size(pos2(gx, top), vec2(graph_w, ROW_H))),
+                rect.intersect(Rect::from_min_size(pos2(gx, top), vec2(cols.graph, ROW_H))),
             );
             let node = pos2(x(row.col), mid);
             let width = 2.0;
@@ -311,8 +518,8 @@ impl RepoTab {
             }
         }
 
-        let mut x = gx + graph_w + 6.0;
-        let text_right = rect.right() - DATE_W - AUTHOR_W - 10.0;
+        let mut x = gx + cols.graph + 6.0;
+        let text_right = rect.right() - cols.trailing() - 10.0;
 
         if is_wip {
             let font = theme::medium(12.5);
@@ -341,6 +548,11 @@ impl RepoTab {
             return resp;
         }
 
+        let font = if is_match {
+            theme::medium(12.5)
+        } else {
+            FontId::proportional(12.5)
+        };
         painter
             .with_clip_rect(Rect::from_min_max(
                 pos2(x, rect.top()),
@@ -350,29 +562,42 @@ impl RepoTab {
                 pos2(x + 2.0, mid),
                 Align2::LEFT_CENTER,
                 &commit.summary,
-                FontId::proportional(12.5),
+                font,
                 t.text,
             );
 
         let small = FontId::proportional(11.5);
-        let author_clip = Rect::from_min_max(
-            pos2(rect.right() - DATE_W - AUTHOR_W, rect.top()),
-            pos2(rect.right() - DATE_W - 8.0, rect.bottom()),
-        );
-        painter.with_clip_rect(author_clip).text(
-            pos2(author_clip.left(), mid),
-            Align2::LEFT_CENTER,
-            &commit.author,
-            small.clone(),
-            t.text_dim,
-        );
-        painter.text(
-            pos2(rect.right() - DATE_W, mid),
-            Align2::LEFT_CENTER,
-            &commit.date,
-            theme::mono(11.0),
-            t.text_faint,
-        );
+        if cols.hash > 0.0 {
+            painter.text(
+                pos2(rect.right() - cols.trailing(), mid),
+                Align2::LEFT_CENTER,
+                commit.hash.get(..7).unwrap_or(&commit.hash),
+                theme::mono(11.0),
+                t.text_faint,
+            );
+        }
+        if cols.author > 0.0 {
+            let author_clip = Rect::from_min_max(
+                pos2(rect.right() - cols.author - cols.date, rect.top()),
+                pos2(rect.right() - cols.date - 8.0, rect.bottom()),
+            );
+            painter.with_clip_rect(author_clip).text(
+                pos2(author_clip.left(), mid),
+                Align2::LEFT_CENTER,
+                &commit.author,
+                small.clone(),
+                t.text_dim,
+            );
+        }
+        if cols.date > 0.0 {
+            painter.text(
+                pos2(rect.right() - cols.date, mid),
+                Align2::LEFT_CENTER,
+                &commit.date,
+                theme::mono(11.0),
+                t.text_faint,
+            );
+        }
         resp
     }
 }
@@ -505,6 +730,7 @@ fn ref_pill(
     badge: &Badge,
     lane: Color32,
     max_w: f32,
+    pr: bool,
 ) -> Rect {
     const ICON: f32 = 15.0;
     let t = Tokens::get(ui.ctx());
@@ -531,6 +757,9 @@ fn ref_pill(
             }
             if !badge.remotes.is_empty() {
                 trail.push("cloud");
+            }
+            if pr {
+                trail.push("git-pull-request");
             }
         }
     }

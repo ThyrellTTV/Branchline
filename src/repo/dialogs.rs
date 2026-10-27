@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use egui::{Key, RichText};
 
 use super::widgets;
-use super::{Action, Refresh, RepoTab};
+use super::{Action, Refresh, RepoTab, Undo};
 use crate::theme::{self, Tokens};
 
 pub enum Dialog {
@@ -41,6 +41,42 @@ pub enum Dialog {
         alternative: Option<(String, Vec<Vec<String>>)>,
         use_alternative: bool,
         refresh: Refresh,
+        undo: Undo,
+    },
+    Stash {
+        message: String,
+        focus: bool,
+    },
+    Tag {
+        at: String,
+        at_label: String,
+        name: String,
+        message: String,
+        /// Remote to push the tag to, if any.
+        remote: Option<String>,
+        push: bool,
+        focus: bool,
+    },
+    RenameBranch {
+        old: String,
+        new: String,
+        focus: bool,
+    },
+    /// Add a remote (`original` = None) or edit one's name and URL.
+    Remote {
+        original: Option<(String, String)>,
+        name: String,
+        url: String,
+        focus: bool,
+    },
+    CreatePr {
+        noun: String,
+        branch: String,
+        base: String,
+        title: String,
+        body: String,
+        draft: bool,
+        focus: bool,
     },
 }
 
@@ -70,6 +106,64 @@ impl Dialog {
             alternative,
             use_alternative: false,
             refresh: Refresh::All,
+            undo: Undo::None,
+        }
+    }
+
+    /// Makes a confirmed operation undoable.
+    pub fn undo(mut self, how: Undo) -> Self {
+        if let Dialog::Confirm { undo, .. } = &mut self {
+            *undo = how;
+        }
+        self
+    }
+
+    pub fn stash() -> Self {
+        Dialog::Stash {
+            message: String::new(),
+            focus: true,
+        }
+    }
+
+    pub fn tag(at: &str, at_label: &str, remote: Option<String>) -> Self {
+        Dialog::Tag {
+            at: at.to_owned(),
+            at_label: at_label.to_owned(),
+            name: String::new(),
+            message: String::new(),
+            remote,
+            push: false,
+            focus: true,
+        }
+    }
+
+    pub fn rename_branch(old: &str) -> Self {
+        Dialog::RenameBranch {
+            old: old.to_owned(),
+            new: old.to_owned(),
+            focus: true,
+        }
+    }
+
+    pub fn remote(original: Option<(String, String)>) -> Self {
+        let (name, url) = original.clone().unwrap_or_default();
+        Dialog::Remote {
+            original,
+            name,
+            url,
+            focus: true,
+        }
+    }
+
+    pub fn create_pr(noun: &str, branch: &str, base: &str, title: &str) -> Self {
+        Dialog::CreatePr {
+            noun: noun.to_owned(),
+            branch: branch.to_owned(),
+            base: base.to_owned(),
+            title: title.to_owned(),
+            body: String::new(),
+            draft: false,
+            focus: true,
         }
     }
 
@@ -154,6 +248,12 @@ impl RepoTab {
 
         let local = &self.refs.local;
         let worktrees = &self.worktrees;
+        // What a new branch's undo checks out again.
+        let previous = self
+            .refs
+            .current
+            .clone()
+            .unwrap_or_else(|| self.refs.head.clone());
         let response = modal.show(ctx, |ui| {
             ui.set_width(380.0);
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
@@ -197,10 +297,16 @@ impl RepoTab {
                             } else {
                                 vec!["branch".into(), name.clone(), at.clone()]
                             };
-                            outcome = Outcome::Done(Action::Ops {
+                            let mut undo = Vec::new();
+                            if *checkout && !previous.is_empty() {
+                                undo.push(vec!["checkout".to_owned(), previous.clone()]);
+                            }
+                            undo.push(vec!["branch".to_owned(), "-D".to_owned(), name.clone()]);
+                            outcome = Outcome::Done(Action::UndoableOps {
                                 label: format!("Create branch {name}"),
-                                ops: vec![args],
+                                ops: vec![args.clone()],
                                 refresh: Refresh::All,
+                                undo: Undo::Custom { undo, redo: vec![args] },
                             });
                         }
                         if ui
@@ -367,6 +473,139 @@ impl RepoTab {
                     }
                     outcome
                 }
+                Dialog::Stash { message, focus } => {
+                    title(ui, "Stash changes", "Puts every change, untracked files included, aside and cleans the working tree.", &t);
+                    let edit = field(ui, message, "Message (optional)", focus);
+                    let _ = edit;
+                    buttons(ui, "Stash", true, enter, || Action::StashPush(message.trim().to_owned()))
+                }
+                Dialog::Tag { at, at_label, name, message, remote, push, focus } => {
+                    title(ui, "Create tag", &format!("At {at_label}"), &t);
+                    field(ui, name, "v1.2.0", focus);
+                    if name.contains(' ') {
+                        *name = name.replace(' ', "-");
+                    }
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(message)
+                            .hint_text("Message (optional: makes an annotated tag)")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    if let Some(remote) = remote {
+                        ui.add_space(4.0);
+                        ui.checkbox(push, format!("Push it to {remote}"));
+                    }
+                    ui.add_space(8.0);
+                    let valid = !name.trim().is_empty();
+                    buttons(ui, "Create", valid, enter && !message.contains('\n'), || {
+                        let name = name.trim().to_owned();
+                        let mut create = vec!["tag".to_owned()];
+                        if !message.trim().is_empty() {
+                            create.extend(["-a".to_owned(), "-m".to_owned(), message.trim().to_owned()]);
+                        }
+                        create.extend([name.clone(), at.clone()]);
+                        let mut steps = vec![create.clone()];
+                        if *push && let Some(remote) = remote {
+                            steps.push(vec!["push".to_owned(), remote.clone(), format!("refs/tags/{name}")]);
+                        }
+                        Action::UndoableOps {
+                            label: format!("Create tag {name}"),
+                            ops: steps,
+                            refresh: Refresh::All,
+                            undo: Undo::Custom {
+                                undo: vec![vec!["tag".to_owned(), "-d".to_owned(), name.clone()]],
+                                redo: vec![create],
+                            },
+                        }
+                    })
+                }
+                Dialog::RenameBranch { old, new, focus } => {
+                    title(ui, "Rename branch", &format!("Renames {old} on this computer; its remote copy keeps its name."), &t);
+                    field(ui, new, "new-name", focus);
+                    if new.contains(' ') {
+                        *new = new.replace(' ', "-");
+                    }
+                    ui.add_space(8.0);
+                    let valid = !new.trim().is_empty() && new.trim() != old.as_str();
+                    buttons(ui, "Rename", valid, enter, || {
+                        let new = new.trim().to_owned();
+                        Action::UndoableOps {
+                            label: format!("Rename {old} to {new}"),
+                            ops: vec![vec!["branch".into(), "-m".into(), old.clone(), new.clone()]],
+                            refresh: Refresh::All,
+                            undo: Undo::Custom {
+                                undo: vec![vec!["branch".into(), "-m".into(), new.clone(), old.clone()]],
+                                redo: vec![vec!["branch".into(), "-m".into(), old.clone(), new]],
+                            },
+                        }
+                    })
+                }
+                Dialog::Remote { original, name, url, focus } => {
+                    let heading = if original.is_some() { "Edit remote" } else { "Add remote" };
+                    title(ui, heading, "A name (like origin or upstream) and the repository's URL.", &t);
+                    field(ui, name, "origin", focus);
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(url)
+                            .hint_text("https://github.com/user/repo.git")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    ui.add_space(8.0);
+                    let valid = !name.trim().is_empty() && !url.trim().is_empty();
+                    buttons(ui, if original.is_some() { "Save" } else { "Add" }, valid, enter, || {
+                        let (name, url) = (name.trim().to_owned(), url.trim().to_owned());
+                        let steps = match original {
+                            None => vec![
+                                vec!["remote".into(), "add".into(), name.clone(), url],
+                                vec!["fetch".into(), name.clone()],
+                            ],
+                            Some((old_name, old_url)) => {
+                                let mut steps = Vec::new();
+                                if *old_name != name {
+                                    steps.push(vec!["remote".into(), "rename".into(), old_name.clone(), name.clone()]);
+                                }
+                                if *old_url != url {
+                                    steps.push(vec!["remote".into(), "set-url".into(), name.clone(), url]);
+                                }
+                                steps
+                            }
+                        };
+                        Action::Ops {
+                            label: format!("Remote {name}"),
+                            ops: steps,
+                            refresh: Refresh::All,
+                        }
+                    })
+                }
+                Dialog::CreatePr { noun, branch, base, title: pr_title, body, draft, focus } => {
+                    title(ui, &format!("Create {noun}"), &format!("{branch} → {base} (the branch is pushed first)"), &t);
+                    field(ui, pr_title, "Title", focus);
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(body)
+                            .hint_text("Description")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(5)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Into").color(t.text_dim));
+                        ui.add(egui::TextEdit::singleline(base).desired_width(160.0));
+                        ui.checkbox(draft, "Draft");
+                    });
+                    ui.add_space(8.0);
+                    let valid = !pr_title.trim().is_empty() && !base.trim().is_empty();
+                    buttons(ui, "Create", valid, false, || Action::CreatePr {
+                        branch: branch.clone(),
+                        base: base.trim().to_owned(),
+                        title: pr_title.trim().to_owned(),
+                        body: body.trim().to_owned(),
+                        draft: *draft,
+                    })
+                }
                 Dialog::Confirm {
                     title,
                     body,
@@ -375,6 +614,7 @@ impl RepoTab {
                     alternative,
                     use_alternative,
                     refresh,
+                    undo,
                 } => {
                     ui.label(RichText::new(title.as_str()).font(theme::semibold(15.0)));
                     ui.add_space(6.0);
@@ -398,10 +638,18 @@ impl RepoTab {
                                 (Some((_, alt)), true) => alt.clone(),
                                 _ => ops.clone(),
                             };
-                            outcome = Outcome::Done(Action::Ops {
-                                label: title.clone(),
-                                ops: steps,
-                                refresh: *refresh,
+                            outcome = Outcome::Done(match undo {
+                                Undo::None => Action::Ops {
+                                    label: title.clone(),
+                                    ops: steps,
+                                    refresh: *refresh,
+                                },
+                                undo => Action::UndoableOps {
+                                    label: title.clone(),
+                                    ops: steps,
+                                    refresh: *refresh,
+                                    undo: undo.clone(),
+                                },
                             });
                         }
                         if ui
@@ -427,4 +675,49 @@ impl RepoTab {
             Outcome::Suggest => dialog.suggest_path(),
         }
     }
+}
+
+/// A dialog's heading and one line under it.
+fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
+    ui.label(RichText::new(heading).font(theme::semibold(15.0)));
+    ui.label(RichText::new(sub).color(t.text_dim));
+    ui.add_space(10.0);
+}
+
+/// A single-line field that takes the keyboard when the dialog opens.
+fn field(ui: &mut egui::Ui, text: &mut String, hint: &str, focus: &mut bool) -> egui::Response {
+    let edit = ui.add(
+        egui::TextEdit::singleline(text)
+            .hint_text(hint)
+            .desired_width(f32::INFINITY)
+            .margin(egui::Margin::symmetric(8, 6)),
+    );
+    if *focus {
+        edit.request_focus();
+        *focus = false;
+    }
+    edit
+}
+
+/// The primary button (also Enter, when `enter`) and Cancel.
+fn buttons(
+    ui: &mut egui::Ui,
+    label: &str,
+    valid: bool,
+    enter: bool,
+    done: impl FnOnce() -> Action,
+) -> Outcome {
+    let mut outcome = Outcome::Open;
+    ui.horizontal(|ui| {
+        if widgets::primary_button(ui, label, valid, 90.0).clicked() || (enter && valid) {
+            outcome = Outcome::Done(done());
+        }
+        if ui
+            .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 30.0)))
+            .clicked()
+        {
+            outcome = Outcome::Cancel;
+        }
+    });
+    outcome
 }
