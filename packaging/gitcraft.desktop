@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=gitcraft
+Comment=A small visual git client
+Exec=gitcraft %f
+Terminal=false
+Categories=Development;RevisionControl;

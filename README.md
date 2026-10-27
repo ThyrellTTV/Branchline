@@ -74,6 +74,13 @@ so your config, credentials and hooks apply as usual.
   background.
 - Themes: Dark, Medium Gray and Light, from PhotoCraft's Pro palettes.
 
+## Download
+
+Ready-made builds for Windows and Linux (x86-64) are on the
+[releases page](https://github.com/Vancete/gitcraft/releases): unzip and run `gitcraft.exe`
+(Windows) or `gitcraft` (Linux). Git must be installed. A release is built by
+`.github/workflows/release.yml` whenever a `v*` tag is pushed.
+
 ## Build and run
 
 ```bash
@@ -122,3 +129,7 @@ was made this way, on a demo repository.
 | `src/app.rs` | window shell: tabs, start page, cloning, palette, settings, toasts |
 
 Assets and their licences: [ATTRIBUTION.md](ATTRIBUTION.md).
+
+## License
+
+MIT OR Apache-2.0, at your option ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
