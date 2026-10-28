@@ -1,6 +1,7 @@
 //! Window shell: git check, browser-like tabs, the start page and cloning.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 
 use egui::{Align2, CornerRadius, Key, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -11,9 +12,15 @@ use crate::icons;
 use crate::repo::RepoTab;
 use crate::settings::Settings;
 use crate::theme::{self, ThemeKind, Tokens};
+use crate::update;
 
 const MAX_RECENT: usize = 12;
 const TAB_H: f32 = 34.0;
+
+/// Set by `main` when the window was closed maximized: it opens restored and is maximized once
+/// it shows its first frame. Created maximized, winit shows the hidden window for an instant
+/// (`ShowWindow(SW_MAXIMIZE)`) before anything is painted, a white flash on Windows.
+pub static MAXIMIZE_WHEN_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// What survives a restart.
 #[derive(Default, Serialize, Deserialize)]
@@ -25,6 +32,10 @@ struct Saved {
     theme: ThemeKind,
     clone_parent: Option<PathBuf>,
     settings: Settings,
+    /// Unix time of the last update check.
+    update_checked: i64,
+    /// A release the user chose to skip.
+    skipped_version: String,
 }
 
 enum Tab {
@@ -41,6 +52,10 @@ struct CloneForm {
     name_edited: bool,
     error: Option<String>,
     focus: bool,
+    /// The remote asked for a username and password / token.
+    auth: bool,
+    username: String,
+    password: String,
 }
 
 pub struct App {
@@ -55,6 +70,13 @@ pub struct App {
     clone_form: Option<CloneForm>,
     /// A clone running in the background: (destination, result).
     cloning: Option<(PathBuf, Receiver<Result<(), String>>)>,
+    /// The form of the running clone, back on screen if it needs credentials.
+    cloning_form: Option<CloneForm>,
+    /// A newer release than this build.
+    update: Option<update::Release>,
+    update_rx: Option<Receiver<Result<update::Release, String>>>,
+    update_checked: i64,
+    skipped_version: String,
     settings: Settings,
     settings_open: bool,
     palette: Option<Palette>,
@@ -118,7 +140,21 @@ impl App {
             was_focused: true,
             clone_form: None,
             cloning: None,
+            cloning_form: None,
+            update: None,
+            update_rx: None,
+            update_checked: saved.update_checked,
+            skipped_version: saved.skipped_version,
         };
+        if saved.settings.check_updates && git::now() - saved.update_checked > update::INTERVAL {
+            let (tx, rx) = channel();
+            let ctx2 = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(update::latest());
+                ctx2.request_repaint();
+            });
+            app.update_rx = Some(rx);
+        }
         if app.git_version.is_ok() {
             for path in saved.open {
                 if path.is_dir() {
@@ -224,6 +260,9 @@ impl App {
             name_edited: false,
             error: None,
             focus: true,
+            auth: false,
+            username: String::new(),
+            password: String::new(),
         });
     }
 
@@ -358,6 +397,34 @@ impl App {
                 ui.add_space(6.0);
                 if icons::small_button(ui, "settings", "Settings").clicked() {
                     self.settings_open = true;
+                }
+                if let Some(release) = self.update.clone() {
+                    let pill = ui.add(
+                        egui::Button::new(
+                            RichText::new(format!("v{} available", release.version))
+                                .color(t.accent_text)
+                                .font(theme::medium(11.5)),
+                        )
+                        .fill(t.accent)
+                        .corner_radius(10.0),
+                    );
+                    egui::Popup::menu(&pill).show(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "gitcraft {} is out (you have {}).",
+                                release.version,
+                                update::CURRENT
+                            ))
+                            .color(t.text_dim),
+                        );
+                        if ui.button("Open the release page").clicked() {
+                            let _ = open::that_detached(&release.url);
+                        }
+                        if ui.button("Skip this version").clicked() {
+                            self.skipped_version = release.version.clone();
+                            self.update = None;
+                        }
+                    });
                 }
                 if icons::small_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
                     self.open_palette();
@@ -548,6 +615,28 @@ impl App {
                         .color(t.text_faint)
                         .small(),
                 );
+                if form.auth {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("The remote wants to know who you are. Most hosts take a personal access token as the password.")
+                            .color(t.text_dim)
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.username)
+                            .hint_text("Username")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.password)
+                            .password(true)
+                            .hint_text("Password or token")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                }
                 if let Some(err) = &form.error {
                     ui.colored_label(t.danger, err);
                 }
@@ -585,19 +674,38 @@ impl App {
                 return;
             }
             let url = form.url.trim().to_owned();
+            let creds = (form.auth && !form.username.trim().is_empty()).then(|| git::Credentials {
+                username: form.username.trim().to_owned(),
+                password: form.password.clone(),
+            });
             self.clone_parent = Some(PathBuf::from(form.parent.trim()));
             let (tx, rx) = channel();
             let ctx2 = ctx.clone();
             let dest2 = dest.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(git::clone(&url, &dest2));
+                let _ = tx.send(git::clone(&url, &dest2, creds.as_ref()));
                 ctx2.request_repaint();
             });
             self.cloning = Some((dest, rx));
-            self.clone_form = None;
+            self.cloning_form = self.clone_form.take();
             self.error = None;
         } else if cancel {
             self.clone_form = None;
+        }
+    }
+
+    fn poll_update(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.update_rx = None;
+        // A failed check (offline…) is tried again next start.
+        if let Ok(release) = result {
+            self.update_checked = git::now();
+            if update::newer(&release.version, update::CURRENT)
+                && release.version != self.skipped_version
+            {
+                self.update = Some(release);
+            }
         }
     }
 
@@ -612,9 +720,33 @@ impl App {
             Ok(()) => {
                 // Show it in a start page tab if one is active, otherwise in a new tab.
                 self.open_repo(&dest, ctx);
+                // The credentials that cloned it also fetch and push in its tab.
+                if let Some(form) = self.cloning_form.take().filter(|f| f.auth)
+                    && let Some(Tab::Repo(repo)) = self.tabs.get_mut(self.active)
+                {
+                    repo.set_credentials(git::Credentials {
+                        username: form.username.trim().to_owned(),
+                        password: form.password,
+                    });
+                }
             }
+            // Back to the form, asking for credentials.
+            Err(e) if git::is_auth_error(&e) => match self.cloning_form.take() {
+                Some(mut form) => {
+                    form.error = Some(if form.auth {
+                        "Those credentials were refused.".to_owned()
+                    } else {
+                        "This repository needs you to sign in.".to_owned()
+                    });
+                    form.auth = true;
+                    form.password.clear();
+                    self.clone_form = Some(form);
+                }
+                None => self.error = Some(format!("Clone failed: {e}")),
+            },
             Err(e) => self.error = Some(format!("Clone failed: {e}")),
         }
+        self.cloning_form = None;
     }
 
     fn git_missing(&mut self, ui: &mut Ui, err: &str) {
@@ -643,6 +775,16 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
 
+        // eframe shows the window after the first frame; maximize it on the next one.
+        if MAXIMIZE_WHEN_SHOWN.load(Ordering::Relaxed) {
+            if ctx.cumulative_frame_nr() >= 1 {
+                MAXIMIZE_WHEN_SHOWN.store(false, Ordering::Relaxed);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
         if let Err(err) = self.git_version.clone() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(t.dock))
@@ -650,6 +792,7 @@ impl eframe::App for App {
             return;
         }
         self.poll_clone(&ctx);
+        self.poll_update();
 
         // Shortcuts.
         // A focused text field or the terminal keeps these keys for itself.
@@ -773,9 +916,17 @@ impl eframe::App for App {
             theme: self.theme,
             clone_parent: self.clone_parent.clone(),
             settings: self.settings.clone(),
+            update_checked: self.update_checked,
+            skipped_version: self.skipped_version.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &saved);
     }
+}
+
+/// The window and taskbar icon (the `.exe` gets the same picture from `build.rs`).
+pub fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/gitcraft-256.png"))
+        .unwrap_or_default()
 }
 
 /// A large clickable card on the start page.
@@ -1195,7 +1346,17 @@ fn notify(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::fuzzy;
+    use super::{fuzzy, window_icon};
+
+    #[test]
+    fn window_icon_decodes() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert!(
+            icon.rgba.chunks(4).any(|p| p[3] > 0),
+            "the icon isn't blank"
+        );
+    }
 
     #[test]
     fn fuzzy_matching() {

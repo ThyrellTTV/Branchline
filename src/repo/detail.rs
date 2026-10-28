@@ -234,7 +234,7 @@ impl RepoTab {
                         selected,
                         RowExtra::Stats(f.added, f.removed),
                     );
-                    widgets::file_menu(&r.row, &f.path, acts);
+                    widgets::file_menu(&r.row, &f.path, Some(&detail.hash), false, acts);
                     if r.row.clicked() {
                         acts.push(Action::OpenDiff(key));
                     }
@@ -388,7 +388,7 @@ impl RepoTab {
             RowExtra::Buttons(buttons),
         );
         if f.code != 'D' {
-            widgets::file_menu(&r.row, &f.path, acts);
+            widgets::file_menu(&r.row, &f.path, None, true, acts);
         }
         match r.button {
             Some(i) => RowClick::Button(i),

@@ -10,3 +10,4 @@ mod repo;
 mod settings;
 mod terminal;
 mod theme;
+mod update;

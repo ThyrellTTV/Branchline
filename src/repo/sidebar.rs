@@ -4,7 +4,9 @@
 use egui::{Align2, Rect, Response, Sense, Ui, pos2, vec2};
 
 use super::widgets::{self, ROW_H};
-use super::{Action, Dialog, Refresh, RepoTab, Undo, merge_action, ops, rebase_action};
+use super::{
+    Action, Dialog, Refresh, RepoTab, Undo, fast_forward_action, merge_action, ops, rebase_action,
+};
 use crate::git::{self, Branch};
 use crate::icons;
 use crate::theme::{self, Tokens};
@@ -225,6 +227,15 @@ impl RepoTab {
             if ui
                 .add_enabled(
                     idle,
+                    egui::Button::new(format!("Fast-forward {current} to {}", b.name)),
+                )
+                .clicked()
+            {
+                acts.push(fast_forward_action(&b.name, current));
+            }
+            if ui
+                .add_enabled(
+                    idle,
                     egui::Button::new(format!("Merge {} into {current}", b.name)),
                 )
                 .clicked()
@@ -239,6 +250,18 @@ impl RepoTab {
                 .clicked()
             {
                 acts.push(rebase_action(&b.name, current));
+            }
+            if ui
+                .add_enabled(
+                    idle,
+                    egui::Button::new(format!("Interactive rebase {current} onto {}…", b.name)),
+                )
+                .clicked()
+            {
+                acts.push(Action::InteractiveRebase {
+                    onto: b.name.clone(),
+                    label: b.name.clone(),
+                });
             }
         }
         ui.separator();
@@ -472,6 +495,15 @@ impl RepoTab {
                         acts.push(Action::CheckoutRemote(b.name.clone()));
                     }
                     if let Some(current) = current.as_deref() {
+                        if ui
+                            .add_enabled(
+                                idle,
+                                egui::Button::new(format!("Fast-forward {current} to it")),
+                            )
+                            .clicked()
+                        {
+                            acts.push(fast_forward_action(&b.name, current));
+                        }
                         if ui
                             .add_enabled(idle, egui::Button::new(format!("Merge into {current}")))
                             .clicked()

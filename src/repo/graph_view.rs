@@ -7,7 +7,10 @@ use egui::{
 };
 
 use super::widgets;
-use super::{Action, Dialog, Refresh, RepoTab, Undo, WIP_HASH, ops};
+use super::{
+    Action, Dialog, Refresh, RepoTab, Undo, WIP_HASH, fast_forward_action, merge_action, ops,
+    rebase_action,
+};
 use crate::git::{self, Refs};
 use crate::icons;
 use crate::settings::Settings;
@@ -168,7 +171,7 @@ impl RepoTab {
                     );
                     continue;
                 }
-                let resp = self.commit_row(ui, i, cols, lanes, now);
+                let resp = self.commit_row(ui, i, cols, lanes, now, acts);
                 if resp.clicked() {
                     acts.push(Action::Select(i));
                 }
@@ -218,7 +221,82 @@ impl RepoTab {
             .iter()
             .filter(|b| b.target == hash)
             .collect();
+        // The branch whose pill was right-clicked, else the commit's first branch for copying.
+        let pill: Option<String> = resp
+            .ctx
+            .data(|d| d.get_temp::<Option<String>>(pill_menu_id(&hash)))
+            .flatten();
+        let branch_name = pill.clone().or_else(|| {
+            badges(&commit.refs, &self.refs)
+                .into_iter()
+                .find(|b| b.kind == BadgeKind::Branch)
+                .map(|b| b.git_ref())
+        });
+        let target = self
+            .refs
+            .current
+            .clone()
+            .unwrap_or_else(|| "HEAD".to_owned());
         resp.context_menu(|ui| {
+            if let Some(branch) = &pill
+                && self.refs.current.as_deref() != Some(branch.as_str())
+            {
+                if ui
+                    .add_enabled(idle, egui::Button::new(format!("Check out {branch}")))
+                    .clicked()
+                {
+                    let local = self.refs.local.iter().any(|b| &b.name == branch);
+                    acts.push(if local {
+                        Action::Checkout(branch.clone())
+                    } else {
+                        Action::CheckoutRemote(branch.clone())
+                    });
+                }
+                if let Some(current) = self.refs.current.as_deref() {
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new(format!("Fast-forward {current} to {branch}")),
+                        )
+                        .clicked()
+                    {
+                        acts.push(fast_forward_action(branch, current));
+                    }
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new(format!("Merge {branch} into {current}")),
+                        )
+                        .clicked()
+                    {
+                        acts.push(merge_action(branch, current));
+                    }
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new(format!("Rebase {current} onto {branch}")),
+                        )
+                        .clicked()
+                    {
+                        acts.push(rebase_action(branch, current));
+                    }
+                    if ui
+                        .add_enabled(
+                            idle,
+                            egui::Button::new(format!(
+                                "Interactive rebase {current} onto {branch}…"
+                            )),
+                        )
+                        .clicked()
+                    {
+                        acts.push(Action::InteractiveRebase {
+                            onto: branch.clone(),
+                            label: branch.clone(),
+                        });
+                    }
+                }
+                ui.separator();
+            }
             for b in &here {
                 ui.menu_button(format!("Branch {}", b.name), |ui| {
                     self.branch_menu_items(ui, acts, b, idle);
@@ -246,6 +324,19 @@ impl RepoTab {
             if ui
                 .add_enabled(
                     idle && !is_head,
+                    egui::Button::new(format!("Interactive rebase {target} onto this commit…")),
+                )
+                .on_hover_text("Reorder, reword, squash or drop the commits after this one")
+                .clicked()
+            {
+                acts.push(Action::InteractiveRebase {
+                    onto: hash.clone(),
+                    label: short.clone(),
+                });
+            }
+            if ui
+                .add_enabled(
+                    idle && !is_head,
                     egui::Button::new("Cherry-pick onto current branch"),
                 )
                 .clicked()
@@ -268,7 +359,6 @@ impl RepoTab {
                     undo: Undo::HeadMove { mode: "--keep" },
                 });
             }
-            let target = self.refs.current.clone().unwrap_or_else(|| "HEAD".to_owned());
             ui.add_enabled_ui(idle && !is_head, |ui| {
                 ui.menu_button(format!("Reset {target} to here"), |ui| {
                     for (mode, undo_mode, label, explain) in [
@@ -298,7 +388,96 @@ impl RepoTab {
             if ui.button("Copy message").clicked() {
                 ui.ctx().copy_text(summary.clone());
             }
+            if let Some(name) = &branch_name
+                && ui.button(format!("Copy branch name ({name})")).clicked()
+            {
+                ui.ctx().copy_text(name.clone());
+            }
         });
+    }
+
+    /// What double-clicking a pill does: check out that branch (a tracking branch for one only on
+    /// a remote) or tag. Nothing for the checked-out one or while an operation runs.
+    fn pill_checkout(&self, badge: &Badge) -> Option<Action> {
+        if badge.head || self.busy_op.is_some() {
+            return None;
+        }
+        match badge.kind {
+            BadgeKind::Branch if badge.local => Some(Action::Checkout(badge.label.clone())),
+            BadgeKind::Branch => badge
+                .remotes
+                .first()
+                .map(|remote| Action::CheckoutRemote(format!("{remote}/{}", badge.label))),
+            BadgeKind::Tag => Some(Action::Checkout(format!("refs/tags/{}", badge.label))),
+            BadgeKind::DetachedHead => None,
+        }
+    }
+
+    /// While the pointer is on a row's `+N` (or on the list itself), every pill of the commit
+    /// stacked over the row, to pick one to check out. Returns whether it is open.
+    #[allow(clippy::too_many_arguments)]
+    fn ref_stack(
+        &self,
+        ui: &Ui,
+        badges: &[Badge],
+        i: usize,
+        more: Rect,
+        at: Pos2,
+        cols: Cols,
+        lane: Color32,
+        acts: &mut Vec<Action>,
+    ) -> bool {
+        let t = Tokens::get(ui.ctx());
+        let id = ui.id().with(("ref_stack", i));
+        let last: Option<Rect> = ui.data(|d| d.get_temp(id));
+        let open = ui
+            .ctx()
+            .pointer_hover_pos()
+            .is_some_and(|p| more.contains(p) || last.is_some_and(|r| r.expand(2.0).contains(p)));
+        if !open {
+            ui.data_mut(|d| d.remove::<Rect>(id));
+            return false;
+        }
+        let slot_w = (cols.refs - 16.0).max(160.0);
+        let shown = egui::Area::new(id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(at)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for b in badges {
+                            let (slot, resp) =
+                                ui.allocate_exact_size(vec2(slot_w, 20.0), Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(
+                                    slot.expand(2.0),
+                                    CornerRadius::same(t.radius as u8),
+                                    t.hover,
+                                );
+                            }
+                            let pr = b.kind == BadgeKind::Branch
+                                && self.prs.iter().any(|p| p.branch == b.label);
+                            ref_pill(ui, ui.painter(), slot.left_center(), b, lane, slot_w, pr);
+                            let hint = if b.head {
+                                "checked out"
+                            } else {
+                                "double-click to check out"
+                            };
+                            let resp = resp.on_hover_text(format!("{} ({hint})", b.describe()));
+                            if resp.double_clicked() {
+                                if let Some(act) = self.pill_checkout(b) {
+                                    acts.push(act);
+                                }
+                            } else if resp.clicked() {
+                                acts.push(Action::Select(i));
+                            }
+                        }
+                    });
+            });
+        ui.data_mut(|d| d.insert_temp(id, shown.response.rect));
+        true
     }
 
     fn search_bar(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
@@ -363,7 +542,15 @@ impl RepoTab {
             });
     }
 
-    fn commit_row(&self, ui: &mut Ui, i: usize, cols: Cols, lanes: usize, now: i64) -> Response {
+    fn commit_row(
+        &self,
+        ui: &mut Ui,
+        i: usize,
+        cols: Cols,
+        lanes: usize,
+        now: i64,
+        acts: &mut Vec<Action>,
+    ) -> Response {
         let t = Tokens::get(ui.ctx());
         let (rect, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
@@ -424,13 +611,34 @@ impl RepoTab {
                 max_w.max(40.0),
                 has_pr,
             );
+            // Right-clicking a branch pill puts that branch's actions on top of the menu.
+            if resp.secondary_clicked() {
+                let on_pill = ui
+                    .ctx()
+                    .pointer_interact_pos()
+                    .is_some_and(|p| pill.contains(p));
+                let branch = (on_pill && first.kind == BadgeKind::Branch).then(|| first.git_ref());
+                ui.data_mut(|d| d.insert_temp(pill_menu_id(&commit.hash), branch));
+            }
+            if resp.double_clicked()
+                && ui
+                    .ctx()
+                    .pointer_interact_pos()
+                    .is_some_and(|p| pill.contains(p))
+                && let Some(act) = self.pill_checkout(first)
+            {
+                acts.push(act);
+            }
             let mut end = pill.right();
+            let mut more_rect = None;
             if more > 0 {
                 let r = Rect::from_min_size(pos2(end + 3.0, mid - 10.0), vec2(more_w - 3.0, 20.0));
                 rp.rect_filled(
                     r,
                     CornerRadius::same(t.radius as u8),
-                    row_color.lerp_to_gamma(Color32::BLACK, 0.35),
+                    row_color
+                        .lerp_to_gamma(Color32::BLACK, 0.35)
+                        .gamma_multiply(0.6),
                 );
                 rp.text(
                     r.center(),
@@ -440,6 +648,7 @@ impl RepoTab {
                     Color32::WHITE,
                 );
                 end = r.right();
+                more_rect = Some(r);
             }
             let avatar = pos2(end + 5.0 + AVATAR_D / 2.0, mid);
             let when_rect = Rect::from_min_size(
@@ -464,11 +673,15 @@ impl RepoTab {
                 when_galley,
                 t.text_dim,
             );
+            let stack_open = more_rect.is_some_and(|more| {
+                let at = pos2(rect.left() + 2.0, mid - 16.0);
+                self.ref_stack(ui, &badges, i, more, at, cols, row_color, acts)
+            });
             let refs_cell = Rect::from_min_max(rect.min, pos2(gx, bottom));
-            if ui.rect_contains_pointer(refs_cell) {
+            if !stack_open && ui.rect_contains_pointer(refs_cell) {
                 let lines: Vec<String> = badges.iter().map(Badge::describe).collect();
                 resp = resp.on_hover_text(format!(
-                    "{}\nTip commit by {} · {}",
+                    "{}\nTip commit by {} · {}\nDouble-click a pill to check it out",
                     lines.join("\n"),
                     commit.author,
                     commit.date
@@ -622,7 +835,20 @@ enum BadgeKind {
     DetachedHead,
 }
 
+/// Where a row remembers which branch pill was right-clicked, for its menu.
+fn pill_menu_id(hash: &str) -> egui::Id {
+    egui::Id::new(("pill_menu", hash))
+}
+
 impl Badge {
+    /// The name git knows a branch pill by: the local branch, else `remote/branch`.
+    fn git_ref(&self) -> String {
+        match self.remotes.first() {
+            Some(remote) if !self.local => format!("{remote}/{}", self.label),
+            _ => self.label.clone(),
+        }
+    }
+
     fn describe(&self) -> String {
         match self.kind {
             BadgeKind::Tag => format!("tag {}", self.label),
@@ -741,6 +967,12 @@ fn ref_pill(
         BadgeKind::Branch => lane.lerp_to_gamma(Color32::BLACK, 0.35),
         BadgeKind::Tag => Color32::from_rgb(104, 104, 112),
         BadgeKind::DetachedHead => t.warning,
+    };
+    // Every pill but the checked-out one is a little see-through.
+    let fill = if badge.head {
+        fill
+    } else {
+        fill.gamma_multiply(0.6)
     };
     let mut lead = Vec::new();
     let mut trail = Vec::new();

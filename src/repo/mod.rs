@@ -5,8 +5,10 @@ mod conflict;
 mod detail;
 mod dialogs;
 mod diff;
+mod file_view;
 mod graph_view;
 mod highlight;
+mod rebase;
 mod sidebar;
 pub(crate) mod widgets;
 
@@ -45,6 +47,13 @@ enum Msg {
     Status(Result<WorkStatus, String>),
     Detail(String, Result<CommitDetail, String>),
     Diff(DiffKey, Result<diff::DiffData, String>),
+    FileHistory(String, Result<Vec<git::FileCommit>, String>),
+    Blame(String, Option<String>, Result<file_view::BlameData, String>),
+    RebaseCommits {
+        onto: String,
+        label: String,
+        result: Result<Vec<git::RebaseCommit>, String>,
+    },
     Search(String, Result<Vec<String>, String>),
     Prs(Result<Vec<PullRequest>, String>),
     OpDone {
@@ -97,6 +106,15 @@ pub(crate) struct UndoEntry {
     label: String,
     undo: Vec<Vec<String>>,
     redo: Vec<Vec<String>>,
+}
+
+/// An operation as `run_ops_ex` got it, kept to retry it with credentials.
+struct PendingOp {
+    label: String,
+    ops: Vec<Vec<String>>,
+    refresh: Refresh,
+    kind: OpKind,
+    quiet: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +208,27 @@ pub(crate) enum Action {
         ignore_ws: bool,
     },
     SaveConflict,
+    /// A file's history or blame in the central pane (`rev`: the commit to blame at).
+    FileView {
+        path: String,
+        rev: Option<String>,
+        tab: file_view::FileTab,
+    },
+    CloseFileView,
+    /// Open the interactive rebase editor for the commits after `onto`.
+    InteractiveRebase {
+        onto: String,
+        label: String,
+    },
+    RunRebase,
+    CloseRebase,
+    /// Remember these HTTPS credentials and run the operation that needed them again.
+    SignIn(git::Credentials),
+    /// Add `pattern` to `.gitignore`; stop tracking `path` if git tracks it.
+    Ignore {
+        pattern: String,
+        path: String,
+    },
 }
 
 pub struct RepoTab {
@@ -228,6 +267,14 @@ pub struct RepoTab {
     detail: Option<CommitDetail>,
     detail_error: Option<String>,
     diff: Option<DiffView>,
+    file_view: Option<file_view::FileView>,
+    rebase: Option<rebase::RebaseEditor>,
+    /// HTTPS credentials typed in this session, used for every later git command of the tab.
+    credentials: Option<git::Credentials>,
+    /// The last operation started, to run again after signing in.
+    last_op: Option<PendingOp>,
+    /// The forge has been asked for avatars.
+    avatars_hinted: bool,
     diff_split: bool,
     diff_ignore_ws: bool,
     conflict: Option<conflict::ConflictEditor>,
@@ -311,6 +358,11 @@ impl RepoTab {
             detail: None,
             detail_error: None,
             diff: None,
+            file_view: None,
+            rebase: None,
+            credentials: None,
+            last_op: None,
+            avatars_hinted: false,
             diff_split: false,
             diff_ignore_ws: false,
             conflict: None,
@@ -559,6 +611,7 @@ impl RepoTab {
         let hash = commit.hash.clone();
         self.selected = Some(row);
         self.stash_view = None;
+        self.file_view = None;
         if matches!(
             self.diff,
             Some(DiffView {
@@ -596,6 +649,7 @@ impl RepoTab {
         let hash = stash.hash.clone();
         self.stash_view = Some(i);
         self.selected = None;
+        self.file_view = None;
         self.diff = None;
         self.conflict = None;
         self.load_detail(hash, ctx);
@@ -660,6 +714,44 @@ impl RepoTab {
         });
     }
 
+    /// Shows `path`'s history or blame, loading what that tab needs.
+    fn open_file_view(
+        &mut self,
+        path: String,
+        rev: Option<String>,
+        tab: file_view::FileTab,
+        ctx: &egui::Context,
+    ) {
+        self.diff = None;
+        self.conflict = None;
+        let view = match self.file_view.take() {
+            Some(mut v) if v.path == path && v.rev == rev => {
+                v.tab = tab;
+                v
+            }
+            _ => file_view::FileView::new(&path, rev.clone(), tab),
+        };
+        let needs = view.needs(tab);
+        self.file_view = Some(view);
+        if !needs {
+            return;
+        }
+        let repo = self.path.clone();
+        match tab {
+            file_view::FileTab::History => spawn(&self.tx, ctx, move || {
+                let result = git::file_history(&repo, rev.as_deref(), &path);
+                Msg::FileHistory(path, result)
+            }),
+            file_view::FileTab::Blame => {
+                let dark = Tokens::get(ctx).dark();
+                spawn(&self.tx, ctx, move || {
+                    let result = file_view::load_blame(&repo, rev.as_deref(), &path, dark);
+                    Msg::Blame(path, rev, result)
+                })
+            }
+        }
+    }
+
     fn reopen_diff(&mut self, ctx: &egui::Context) {
         if let Some(view) = self.diff.take() {
             self.conflict = None;
@@ -696,13 +788,21 @@ impl RepoTab {
         if !quiet {
             self.status = None;
         }
+        self.last_op = Some(PendingOp {
+            label: label.to_owned(),
+            ops: ops.clone(),
+            refresh,
+            kind: kind.clone(),
+            quiet,
+        });
         let path = self.path.clone();
         let label = label.to_owned();
+        let creds = self.credentials.clone();
         spawn(&self.tx, ctx, move || {
             let mut result = Ok(String::new());
             for op in &ops {
                 let args: Vec<&str> = op.iter().map(String::as_str).collect();
-                result = git::run(Some(&path), &args);
+                result = git::run_with(Some(&path), &args, creds.as_ref());
                 if result.is_err() {
                     break;
                 }
@@ -789,6 +889,50 @@ impl RepoTab {
             },
             ctx,
         );
+    }
+
+    /// Once per tab, on a GitHub / GitLab repository: tells the avatar loader where its authors'
+    /// account pictures are.
+    fn hint_avatars(&mut self, ctx: &egui::Context) {
+        if self.avatars_hinted || !Settings::get(ctx).avatars {
+            return;
+        }
+        let Some(forge) = self.forge else { return };
+        let Some((host, path)) = self
+            .remotes
+            .iter()
+            .find(|r| r.name == "origin")
+            .or_else(|| self.remotes.first())
+            .and_then(|r| forge::location(&r.url))
+        else {
+            return;
+        };
+        self.avatars_hinted = true;
+        let repo = self.path.clone();
+        let mut emails: Vec<String> = self.history.iter().map(|c| c.email.clone()).collect();
+        emails.sort();
+        emails.dedup();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            match forge {
+                Forge::GitHub => {
+                    for (email, url) in forge::github_avatars(&repo, &host, &path) {
+                        crate::avatars::hint(&email, crate::avatars::Hint::Url(url));
+                    }
+                }
+                Forge::GitLab => {
+                    for email in emails {
+                        crate::avatars::hint(&email, crate::avatars::Hint::GitLab(host.clone()));
+                    }
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// HTTPS credentials for this tab's git commands (from the clone that made it).
+    pub fn set_credentials(&mut self, creds: git::Credentials) {
+        self.credentials = Some(creds);
     }
 
     fn default_remote(&self) -> Option<String> {
@@ -1062,6 +1206,7 @@ impl RepoTab {
                             self.load_prs(ctx);
                         }
                         self.rebuild(ctx);
+                        self.hint_avatars(ctx);
                     }
                     Err(e) => self.load_error = Some(e),
                 }
@@ -1097,6 +1242,42 @@ impl RepoTab {
                         Ok(d) => self.detail = Some(d),
                         Err(e) => self.detail_error = Some(e),
                     }
+                }
+            }
+            Msg::RebaseCommits {
+                onto,
+                label,
+                result,
+            } => match result {
+                Ok(commits) if commits.is_empty() => {
+                    self.status = Some((
+                        format!(
+                            "Nothing to rebase: {label} already contains every commit of this branch"
+                        ),
+                        true,
+                    ));
+                }
+                Ok(commits) => {
+                    self.diff = None;
+                    self.conflict = None;
+                    self.file_view = None;
+                    self.rebase = Some(rebase::RebaseEditor::new(onto, label, commits));
+                }
+                Err(e) => self.status = Some((format!("Interactive rebase: {e}"), true)),
+            },
+            Msg::FileHistory(path, result) => {
+                if let Some(view) = &mut self.file_view
+                    && view.path == path
+                {
+                    view.history = Some(result);
+                }
+            }
+            Msg::Blame(path, rev, result) => {
+                if let Some(view) = &mut self.file_view
+                    && view.path == path
+                    && view.rev == rev
+                {
+                    view.blame = Some(result);
                 }
             }
             Msg::Diff(key, result) => {
@@ -1157,6 +1338,17 @@ impl RepoTab {
                             self.load_prs(ctx);
                         }
                         self.record_undo(&label, kind);
+                    }
+                    Err(e) if git::is_auth_error(e) && !quiet => {
+                        // Typed credentials that were refused are forgotten.
+                        let refused = self.credentials.take().is_some();
+                        self.status = Some((format!("{label}: sign-in needed"), true));
+                        let url = self
+                            .default_remote()
+                            .and_then(|r| self.remotes.iter().find(|x| x.name == r))
+                            .map(|r| r.url.clone())
+                            .unwrap_or_default();
+                        self.dialog = Some(Dialog::credentials(&url, refused));
                     }
                     Err(e) => {
                         self.focus_wip = e.contains("CONFLICT") || e.contains("could not apply");
@@ -1356,6 +1548,68 @@ impl RepoTab {
                     self.reopen_diff(ctx);
                 }
             }
+            Action::FileView { path, rev, tab } => self.open_file_view(path, rev, tab, ctx),
+            Action::CloseFileView => self.file_view = None,
+            Action::InteractiveRebase { onto, label } => {
+                let path = self.path.clone();
+                spawn(&self.tx, ctx, move || {
+                    let result = git::rebase_commits(&path, &onto);
+                    Msg::RebaseCommits {
+                        onto,
+                        label,
+                        result,
+                    }
+                });
+            }
+            Action::RunRebase => {
+                let Some(editor) = &self.rebase else { return };
+                if editor.problem().is_some() || self.busy_op.is_some() {
+                    return;
+                }
+                match editor.command() {
+                    Ok(command) => {
+                        let label = format!("Interactive rebase onto {}", editor.onto_label);
+                        self.rebase = None;
+                        self.run_undoable(
+                            &label,
+                            vec![command],
+                            Refresh::All,
+                            Undo::HeadMove { mode: "--keep" },
+                            ctx,
+                        );
+                    }
+                    Err(e) => self.status = Some((e, true)),
+                }
+            }
+            Action::CloseRebase => self.rebase = None,
+            Action::SignIn(creds) => {
+                self.credentials = Some(creds);
+                if let Some(op) = self.last_op.take() {
+                    self.run_ops_ex(&op.label, op.ops, op.refresh, op.kind, op.quiet, ctx);
+                }
+            }
+            Action::Ignore { pattern, path } => match git::add_to_gitignore(&self.path, &pattern) {
+                Err(e) => self.status = Some((e, true)),
+                Ok(added) => {
+                    if git::is_tracked(&self.path, &path) {
+                        self.run_ops(
+                            &format!("Ignore {pattern}"),
+                            ops(&[&["rm", "-r", "--cached", "--quiet", "--", &path]]),
+                            Refresh::Status,
+                            plain,
+                            ctx,
+                        );
+                    } else {
+                        let msg = if added {
+                            format!("Added {pattern} to .gitignore")
+                        } else {
+                            format!("{pattern} was already in .gitignore")
+                        };
+                        self.status = Some((msg, false));
+                        self.reload_status(ctx);
+                    }
+                }
+            },
             Action::SaveConflict => {
                 if let Some(editor) = &self.conflict {
                     match editor.save(&self.path) {
@@ -1396,6 +1650,10 @@ impl RepoTab {
             });
             if esc && self.diff.is_some() {
                 acts.push(Action::CloseDiff);
+            } else if esc && self.rebase.is_some() {
+                acts.push(Action::CloseRebase);
+            } else if esc && self.file_view.is_some() {
+                acts.push(Action::CloseFileView);
             } else if esc && self.search.open {
                 acts.push(Action::ToggleSearch);
             }
@@ -1447,8 +1705,12 @@ impl RepoTab {
             .show(ui, |ui| {
                 if self.conflict.is_some() {
                     self.conflict_view(ui, &mut acts);
+                } else if self.rebase.is_some() {
+                    self.rebase_view(ui, &mut acts);
                 } else if self.diff.is_some() {
                     self.diff_view(ui, &mut acts);
+                } else if self.file_view.is_some() {
+                    self.file_view(ui, &mut acts);
                 } else {
                     self.graph_view(ui, &mut acts);
                 }
@@ -1766,6 +2028,16 @@ pub(crate) fn merge_action(branch: &str, current: &str) -> Action {
     Action::UndoableOps {
         label: format!("Merge {branch} into {current}"),
         ops: ops(&[&["merge", "--no-edit", branch]]),
+        refresh: Refresh::All,
+        undo: Undo::HeadMove { mode: "--keep" },
+    }
+}
+
+/// Moves the current branch forward to `branch`; fails (and says so) if they have diverged.
+pub(crate) fn fast_forward_action(branch: &str, current: &str) -> Action {
+    Action::UndoableOps {
+        label: format!("Fast-forward {current} to {branch}"),
+        ops: ops(&[&["merge", "--ff-only", branch]]),
         refresh: Refresh::All,
         undo: Undo::HeadMove { mode: "--keep" },
     }

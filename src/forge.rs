@@ -1,6 +1,7 @@
 //! Pull requests through the forges' own command-line tools: `gh` for GitHub, `glab` for
 //! GitLab. They hold the user's login, so gitcraft never stores a token.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -174,9 +175,108 @@ pub fn create(
     tool(forge, repo, &args).map(|out| out.trim().to_owned())
 }
 
+/// The web host and `owner/repo` path of a remote URL: `https://host/owner/repo.git`,
+/// `git@host:owner/repo.git` or `ssh://git@host[:port]/owner/repo`.
+pub fn location(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    let (host, path) = match url.split_once("://") {
+        Some((_, rest)) => {
+            let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+            let (host, path) = rest.split_once('/')?;
+            (host.split(':').next().unwrap_or(host), path)
+        }
+        None => {
+            let rest = url.rsplit_once('@').map_or(url, |(_, r)| r);
+            rest.split_once(':')?
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!host.is_empty() && path.contains('/')).then(|| (host.to_lowercase(), path.to_owned()))
+}
+
+/// GitHub accounts' avatars by commit email, from the repository's latest commits (the API ties
+/// each commit to the account its email belongs to). Through `gh` when it's installed (private
+/// repositories, higher limits), else GitHub's public API.
+pub fn github_avatars(repo: &Path, host: &str, path: &str) -> HashMap<String, String> {
+    let endpoint = format!("repos/{path}/commits?per_page=100");
+    let mut args = vec!["api", endpoint.as_str()];
+    if host != "github.com" {
+        args.extend(["--hostname", host]);
+    }
+    let json = tool(Forge::GitHub, repo, &args).or_else(|e| {
+        if host != "github.com" {
+            return Err(e);
+        }
+        ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("gitcraft")
+            .build()
+            .get(&format!("https://api.github.com/{endpoint}"))
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_string()
+            .map_err(|e| e.to_string())
+    });
+    json.map(|j| parse_github_avatars(&j)).unwrap_or_default()
+}
+
+fn parse_github_avatars(json: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str(json) else {
+        return out;
+    };
+    for item in &items {
+        for (who, account) in [("author", "author"), ("committer", "committer")] {
+            let email = item
+                .pointer(&format!("/commit/{who}/email"))
+                .and_then(|e| e.as_str());
+            let avatar = item
+                .pointer(&format!("/{account}/avatar_url"))
+                .and_then(|a| a.as_str());
+            if let (Some(email), Some(avatar)) = (email, avatar) {
+                out.entry(email.trim().to_lowercase())
+                    .or_insert_with(|| avatar.to_owned());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_locations() {
+        let gh = Some(("github.com".to_owned(), "owner/repo".to_owned()));
+        assert_eq!(location("https://github.com/owner/repo.git"), gh);
+        assert_eq!(location("https://user@github.com/owner/repo/"), gh);
+        assert_eq!(location("git@github.com:owner/repo.git"), gh);
+        assert_eq!(location("ssh://git@github.com:22/owner/repo"), gh);
+        assert_eq!(
+            location("https://gitlab.example.org/group/sub/proj.git"),
+            Some(("gitlab.example.org".to_owned(), "group/sub/proj".to_owned()))
+        );
+        assert_eq!(location("/srv/git/repo.git"), None);
+    }
+
+    #[test]
+    fn github_avatars_by_email() {
+        let json = r#"[
+            {"commit": {"author": {"email": "Ann@x.org"}, "committer": {"email": "noreply@github.com"}},
+             "author": {"avatar_url": "https://a/1?v=4"}, "committer": {"avatar_url": "https://a/web?v=4"}},
+            {"commit": {"author": {"email": "nobody@x.org"}, "committer": {"email": "nobody@x.org"}},
+             "author": null, "committer": null}
+        ]"#;
+        let m = parse_github_avatars(json);
+        assert_eq!(
+            m.get("ann@x.org").map(String::as_str),
+            Some("https://a/1?v=4")
+        );
+        assert!(m.contains_key("noreply@github.com"));
+        assert!(!m.contains_key("nobody@x.org"));
+    }
 
     #[test]
     fn detects_forge_from_origin() {

@@ -351,7 +351,11 @@ impl RepoTab {
                         egui::Label::new(egui::RichText::new(&path).font(theme::medium(13.0)))
                             .sense(Sense::click()),
                     );
-                    widgets::file_menu(&title, &path, acts);
+                    let (rev, ignorable) = match &view.key {
+                        DiffKey::Commit { hash, .. } => (Some(hash.as_str()), false),
+                        DiffKey::Work(_) => (None, true),
+                    };
+                    widgets::file_menu(&title, &path, rev, ignorable, acts);
                     widgets::chip(ui, &origin, t.text_dim);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::small_button(ui, "x", "Close (Esc)").clicked() {

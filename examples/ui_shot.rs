@@ -24,6 +24,8 @@ fn main() {
 
     let mut harness = Harness::builder()
         .with_size([1400.0, 860.0])
+        // A frame's worth of time per step, so two clicks make a double-click.
+        .with_step_dt(1.0 / 60.0)
         .build_eframe(|cc| gitcraft::app::App::new(cc, Some(repo.into())));
     settle(&mut harness, 1500);
 
@@ -54,6 +56,7 @@ fn main() {
                 let pos = point(arg);
                 harness.event(Event::PointerMoved(pos));
                 harness.step();
+                // Each press and release in a frame of its own, as a real double-click arrives.
                 for _ in 0..2 {
                     for pressed in [true, false] {
                         harness.event(Event::PointerButton {
@@ -62,8 +65,8 @@ fn main() {
                             pressed,
                             modifiers: Modifiers::NONE,
                         });
+                        harness.step();
                     }
-                    harness.step();
                 }
                 settle(&mut harness, 600);
             }

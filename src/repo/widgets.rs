@@ -491,23 +491,77 @@ pub fn terminal_tabs(
 }
 
 /// Right-click menu for a file of the working tree or a commit: open it, its folder, copy path.
-pub fn file_menu(resp: &Response, path: &str, acts: &mut Vec<super::Action>) {
+/// Right-click menu of a file. `rev`: the commit it is shown in (history and blame start there);
+/// `ignorable`: a working-tree file that can be added to `.gitignore`.
+pub fn file_menu(
+    resp: &Response,
+    path: &str,
+    rev: Option<&str>,
+    ignorable: bool,
+    acts: &mut Vec<super::Action>,
+) {
+    use super::Action;
+    use super::file_view::FileTab;
     resp.context_menu(|ui| {
         let rel = std::path::PathBuf::from(path);
         if ui.button("Open file").clicked() {
-            acts.push(super::Action::OpenPath(rel.clone()));
+            acts.push(Action::OpenPath(rel.clone()));
         }
         if ui.button("Open in editor").clicked() {
-            acts.push(super::Action::OpenInEditor(rel.clone()));
+            acts.push(Action::OpenInEditor(rel.clone()));
         }
         if ui.button(super::reveal_label()).clicked() {
-            acts.push(super::Action::OpenPath(
+            acts.push(Action::OpenPath(
                 rel.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
             ));
+        }
+        ui.separator();
+        if ui.button("File history").clicked() {
+            acts.push(Action::FileView {
+                path: path.to_owned(),
+                rev: rev.map(str::to_owned),
+                tab: FileTab::History,
+            });
+        }
+        if ui.button("Blame").clicked() {
+            acts.push(Action::FileView {
+                path: path.to_owned(),
+                rev: rev.map(str::to_owned),
+                tab: FileTab::Blame,
+            });
+        }
+        if ignorable {
+            ui.menu_button("Ignore", |ui| {
+                for (label, pattern, untrack) in ignore_patterns(path) {
+                    if ui.button(label).clicked() {
+                        acts.push(Action::Ignore {
+                            pattern,
+                            path: untrack,
+                        });
+                    }
+                }
+            });
         }
         ui.separator();
         if ui.button("Copy path").clicked() {
             ui.ctx().copy_text(path.to_owned());
         }
     });
+}
+
+/// The ways to ignore `path`: (menu label, `.gitignore` line, what to stop tracking).
+fn ignore_patterns(path: &str) -> Vec<(String, String, String)> {
+    let p = std::path::Path::new(path);
+    let mut out = vec![("This file".to_owned(), format!("/{path}"), path.to_owned())];
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        out.push((
+            format!("All .{ext} files"),
+            format!("*.{ext}"),
+            path.to_owned(),
+        ));
+    }
+    if let Some(dir) = path.rsplit_once('/').map(|(d, _)| d) {
+        out.push((format!("Folder {dir}/"), format!("/{dir}/"), dir.to_owned()));
+    }
+    out
 }

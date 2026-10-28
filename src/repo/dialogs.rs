@@ -69,6 +69,15 @@ pub enum Dialog {
         url: String,
         focus: bool,
     },
+    /// Username and password / token for an HTTPS remote that asked for them.
+    Credentials {
+        url: String,
+        /// The last ones typed were refused.
+        refused: bool,
+        username: String,
+        password: String,
+        focus: bool,
+    },
     CreatePr {
         noun: String,
         branch: String,
@@ -116,6 +125,16 @@ impl Dialog {
             *undo = how;
         }
         self
+    }
+
+    pub fn credentials(url: &str, refused: bool) -> Self {
+        Dialog::Credentials {
+            url: url.to_owned(),
+            refused,
+            username: String::new(),
+            password: String::new(),
+            focus: true,
+        }
     }
 
     pub fn stash() -> Self {
@@ -580,6 +599,42 @@ impl RepoTab {
                         }
                     })
                 }
+                Dialog::Credentials { url, refused, username, password, focus } => {
+                    let host = host_of(url);
+                    title(
+                        ui,
+                        &format!("Sign in to {host}"),
+                        "git needs a username and password for this remote. Most hosts want a personal access token as the password.",
+                        &t,
+                    );
+                    if *refused {
+                        ui.colored_label(t.danger, "Those credentials were refused. Check them and try again.");
+                        ui.add_space(6.0);
+                    }
+                    field(ui, username, "Username", focus);
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::singleline(password)
+                            .password(true)
+                            .hint_text("Password or token")
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::Margin::symmetric(8, 6)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Used for this tab until you close it. If git has a credential helper (such as Git Credential Manager), it saves them once they work.")
+                            .color(t.text_faint)
+                            .small(),
+                    );
+                    ui.add_space(8.0);
+                    let valid = !username.trim().is_empty() && !password.is_empty();
+                    buttons(ui, "Sign in", valid, enter, || {
+                        Action::SignIn(crate::git::Credentials {
+                            username: username.trim().to_owned(),
+                            password: password.clone(),
+                        })
+                    })
+                }
                 Dialog::CreatePr { noun, branch, base, title: pr_title, body, draft, focus } => {
                     title(ui, &format!("Create {noun}"), &format!("{branch} → {base} (the branch is pushed first)"), &t);
                     field(ui, pr_title, "Title", focus);
@@ -678,6 +733,16 @@ impl RepoTab {
 }
 
 /// A dialog's heading and one line under it.
+/// `github.com` from `https://user@github.com/owner/repo.git`.
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    rest.split(['/', ':'])
+        .next()
+        .filter(|h| !h.is_empty())
+        .unwrap_or("the remote")
+}
+
 fn title(ui: &mut egui::Ui, heading: &str, sub: &str, t: &Tokens) {
     ui.label(RichText::new(heading).font(theme::semibold(15.0)));
     ui.label(RichText::new(sub).color(t.text_dim));

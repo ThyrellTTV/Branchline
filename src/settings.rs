@@ -30,12 +30,14 @@ pub struct Settings {
     pub show_hash: bool,
     /// Background fetch interval in minutes; 0 turns it off.
     pub auto_fetch_minutes: u32,
-    /// Load avatars from Gravatar / GitHub (sends a hash of each author's email).
+    /// Load avatars: GitHub / GitLab accounts on repositories hosted there, Gravatar otherwise.
     pub avatars: bool,
     /// Command that opens a folder or file in the user's editor.
     pub editor: String,
     /// Desktop notifications when a long operation ends while the window is in the background.
     pub notifications: bool,
+    /// Ask GitHub once a day whether a newer release exists.
+    pub check_updates: bool,
     pub profiles: Vec<Profile>,
 }
 
@@ -53,6 +55,7 @@ impl Default for Settings {
             avatars: true,
             editor: "code".to_owned(),
             notifications: true,
+            check_updates: true,
             profiles: Vec::new(),
         }
     }
@@ -103,11 +106,14 @@ impl Settings {
             });
             ui.end_row();
             ui.label("Avatars");
-            ui.checkbox(&mut self.avatars, "Load from Gravatar / GitHub")
-                .on_hover_text("Sends an MD5 hash of each author's email to gravatar.com, or asks GitHub for noreply addresses. Cached on disk.");
+            ui.checkbox(&mut self.avatars, "Load from GitHub, GitLab or Gravatar")
+                .on_hover_text("On a GitHub repository, its commit list says which account each author is; on GitLab, the host is asked by email. Other authors: an MD5 hash of the email goes to gravatar.com. Cached on disk.");
             ui.end_row();
             ui.label("Notifications");
             ui.checkbox(&mut self.notifications, "When a long operation ends in the background");
+            ui.end_row();
+            ui.label("Updates");
+            ui.checkbox(&mut self.check_updates, "Check GitHub for a new version once a day");
             ui.end_row();
         });
 

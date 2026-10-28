@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use egui::{Color32, Rect, Response, RichText, Sense, Ui, Vec2, load::Bytes};
+use egui::{Color32, Rect, Response, Sense, Ui, Vec2, load::Bytes};
 
 use crate::theme::Tokens;
 
@@ -41,6 +41,7 @@ const SOURCES: &[(&str, &str)] = icons![
     "git-branch-plus",
     "git-merge",
     "git-pull-request",
+    "history",
     "laptop",
     "log-in",
     "minus",
@@ -92,20 +93,52 @@ pub fn paint(ui: &Ui, rect: Rect, name: &str, size: f32, tint: Color32) {
 /// A flat toolbar button: icon plus optional label, background only on hover (PhotoCraft's
 /// options-bar buttons).
 pub fn tool_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> Response {
+    // Painted by hand at a fixed size: egui's button adds its border's width only while the
+    // frame shows, so hovering one pushed the rest of the toolbar sideways.
+    const PAD: f32 = 10.0;
+    const ICON: f32 = 16.0;
+    const GAP: f32 = 6.0;
     let t = Tokens::get(ui.ctx());
     let tint = if enabled { t.icon } else { t.text_faint };
-    let mut button = egui::Button::image_and_text(
-        image(icon, 16.0, tint),
-        RichText::new(label).color(if enabled { t.text } else { t.text_faint }),
-    )
-    .frame_when_inactive(false)
-    .min_size(egui::vec2(0.0, 28.0));
-    if label.is_empty() {
-        button = egui::Button::image(image(icon, 16.0, tint))
-            .frame_when_inactive(false)
-            .min_size(egui::vec2(28.0, 28.0));
-    }
-    ui.add_enabled(enabled, button)
+    let color = if enabled { t.text } else { t.text_faint };
+    let galley = (!label.is_empty()).then(|| {
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        ui.painter().layout_no_wrap(label.to_owned(), font, color)
+    });
+    let width = match &galley {
+        Some(g) => PAD + ICON + GAP + g.size().x + PAD,
+        None => 28.0,
+    };
+    ui.add_enabled(enabled, |ui: &mut Ui| {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
+        let r = egui::CornerRadius::same(t.radius_sm as u8);
+        if resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(rect, r, t.pressed);
+        } else if resp.hovered() || resp.has_focus() {
+            ui.painter().rect_filled(rect, r, t.hover);
+            ui.painter().rect_stroke(
+                rect,
+                r,
+                egui::Stroke::new(1.0, t.field_border),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let icon_left = if galley.is_some() {
+            rect.left() + PAD
+        } else {
+            rect.center().x - ICON / 2.0
+        };
+        let icon_rect = Rect::from_min_size(
+            egui::pos2(icon_left, rect.center().y - ICON / 2.0),
+            Vec2::splat(ICON),
+        );
+        paint(ui, icon_rect, icon, ICON, tint);
+        if let Some(g) = galley {
+            let pos = egui::pos2(icon_rect.right() + GAP, rect.center().y - g.size().y / 2.0);
+            ui.painter().galley(pos, g, color);
+        }
+        resp
+    })
 }
 
 /// A small square icon-only button (rows, panel headers).
@@ -115,7 +148,13 @@ pub fn small_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
     if resp.hovered() {
         ui.painter().rect_filled(rect, t.radius_sm, t.pressed);
     }
-    let tint = if resp.hovered() { t.text } else { t.icon };
+    let tint = if !ui.is_enabled() {
+        t.text_faint
+    } else if resp.hovered() {
+        t.text
+    } else {
+        t.icon
+    };
     paint(ui, rect, icon, 14.0, tint);
     resp.on_hover_text(tooltip)
 }

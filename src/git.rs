@@ -18,6 +18,8 @@ fn git_cmd() -> Command {
     cmd.env("GIT_OPTIONAL_LOCKS", "0");
     // `rebase --continue`, `merge --continue`… would otherwise open an editor nobody sees.
     cmd.env("GIT_EDITOR", "true");
+    // Interactive rebases set `sequence.editor` themselves; an inherited one would win.
+    cmd.env_remove("GIT_SEQUENCE_EDITOR");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -51,9 +53,61 @@ pub fn run_bytes(dir: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Like [`run`], but exit codes in `ok` count as success (`diff --no-index` exits 1 on changes).
 pub fn run_ok_codes(dir: Option<&Path>, args: &[&str], ok: &[i32]) -> Result<String, String> {
+    run_inner(dir, args, ok, None)
+}
+
+/// A username and password (or token) for an HTTPS remote, typed into gitcraft.
+#[derive(Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// A credential helper that answers git's `get` from the environment, so the secret never shows
+/// up in a command line. git tries the user's own helpers first and, when the operation works,
+/// asks them to store what this one gave.
+const ENV_HELPER: &str = "credential.helper=!f() { test \"$1\" = get && echo \"username=$GITCRAFT_GIT_USERNAME\" && echo \"password=$GITCRAFT_GIT_PASSWORD\"; }; f";
+
+/// [`run`], answering a credential request with `creds` when given.
+pub fn run_with(
+    dir: Option<&Path>,
+    args: &[&str],
+    creds: Option<&Credentials>,
+) -> Result<String, String> {
+    run_inner(dir, args, &[0], creds)
+}
+
+/// Whether `err` says git needed a username / password it couldn't get or that were refused.
+pub fn is_auth_error(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "invalid username or password",
+        "http basic: access denied",
+        "the requested url returned error: 401",
+        "the requested url returned error: 403",
+    ]
+    .iter()
+    .any(|s| e.contains(s))
+}
+
+fn run_inner(
+    dir: Option<&Path>,
+    args: &[&str],
+    ok: &[i32],
+    creds: Option<&Credentials>,
+) -> Result<String, String> {
     let mut cmd = git_cmd();
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
+    }
+    if let Some(c) = creds {
+        cmd.args(["-c", ENV_HELPER]);
+        cmd.env("GITCRAFT_GIT_USERNAME", &c.username);
+        cmd.env("GITCRAFT_GIT_PASSWORD", &c.password);
     }
     cmd.args(args);
     let out = cmd
@@ -76,9 +130,9 @@ pub fn run_ok_codes(dir: Option<&Path>, args: &[&str], ok: &[i32]) -> Result<Str
 }
 
 /// `git clone url dest`, run from `dest`'s parent.
-pub fn clone(url: &str, dest: &Path) -> Result<(), String> {
+pub fn clone(url: &str, dest: &Path, creds: Option<&Credentials>) -> Result<(), String> {
     let dest = dest.to_string_lossy();
-    run(None, &["clone", "--", url, &dest]).map(|_| ())
+    run_with(None, &["clone", "--", url, &dest], creds).map(|_| ())
 }
 
 /// The folder name `git clone` would pick for `url`.
@@ -794,6 +848,203 @@ pub fn identity(repo: &Path) -> Identity {
     }
 }
 
+/// A commit an interactive rebase would rewrite.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RebaseCommit {
+    pub hash: String,
+    pub author: String,
+    pub email: String,
+    pub summary: String,
+    /// The whole message (summary and body).
+    pub message: String,
+    pub merge: bool,
+}
+
+/// The commits `git rebase -i onto` would list (`onto..HEAD`), oldest first.
+pub fn rebase_commits(repo: &Path, onto: &str) -> Result<Vec<RebaseCommit>, String> {
+    let format = format!("--format={RS}%H{FS}%P{FS}%an{FS}%ae{FS}%s{FS}%B");
+    let range = format!("{onto}..HEAD");
+    let out = run(Some(repo), &["log", "--reverse", &format, &range])?;
+    Ok(parse_rebase_commits(&out))
+}
+
+fn parse_rebase_commits(out: &str) -> Vec<RebaseCommit> {
+    out.split(RS)
+        .filter_map(|record| {
+            let mut f = record.splitn(6, FS);
+            let hash = f.next()?.trim().to_owned();
+            if hash.is_empty() {
+                return None;
+            }
+            Some(RebaseCommit {
+                hash,
+                merge: f.next()?.split_whitespace().count() > 1,
+                author: f.next()?.to_owned(),
+                email: f.next()?.to_owned(),
+                summary: f.next()?.to_owned(),
+                message: f.next()?.trim_end().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Adds `pattern` as a line of the repository's top `.gitignore` (created if missing). `false`
+/// when it was already there.
+pub fn add_to_gitignore(repo: &Path, pattern: &str) -> Result<bool, String> {
+    let file = repo.join(".gitignore");
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read .gitignore: {e}")),
+    };
+    match gitignore_with(&existing, pattern) {
+        Some(updated) => std::fs::write(&file, updated)
+            .map(|_| true)
+            .map_err(|e| format!("could not write .gitignore: {e}")),
+        None => Ok(false),
+    }
+}
+
+/// `existing` with `pattern` appended on a line of its own (keeping its line endings), or `None`
+/// when the line is already there.
+fn gitignore_with(existing: &str, pattern: &str) -> Option<String> {
+    if existing.lines().any(|l| l.trim() == pattern) {
+        return None;
+    }
+    let nl = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = existing.to_owned();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(nl);
+    }
+    out.push_str(pattern);
+    out.push_str(nl);
+    Some(out)
+}
+
+/// Whether git tracks `path` (so ignoring it also needs `git rm --cached`).
+pub fn is_tracked(repo: &Path, path: &str) -> bool {
+    run(Some(repo), &["ls-files", "--error-unmatch", "--", path]).is_ok()
+}
+
+/// One commit in a file's history, with the file's path at that commit (renames are followed).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FileCommit {
+    pub hash: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    pub summary: String,
+    pub path: String,
+}
+
+/// Every commit that changed `path` up to `rev` (HEAD when `None`), newest first, following
+/// renames.
+pub fn file_history(repo: &Path, rev: Option<&str>, path: &str) -> Result<Vec<FileCommit>, String> {
+    let format = format!("--format={RS}%H{FS}%an{FS}%ae{FS}%at{FS}%s");
+    let mut args = vec![
+        "-c",
+        "core.quotePath=false",
+        "log",
+        "--follow",
+        "--name-only",
+        &format,
+    ];
+    if let Some(rev) = rev {
+        args.push(rev);
+    }
+    args.extend(["--", path]);
+    let out = run(Some(repo), &args)?;
+    Ok(parse_file_history(&out))
+}
+
+fn parse_file_history(out: &str) -> Vec<FileCommit> {
+    out.split(RS)
+        .filter_map(|record| {
+            let mut lines = record.lines();
+            let mut f = lines.next()?.split(FS);
+            let mut c = FileCommit {
+                hash: f.next()?.to_owned(),
+                author: f.next().unwrap_or_default().to_owned(),
+                email: f.next().unwrap_or_default().to_owned(),
+                time: f.next().and_then(|t| t.parse().ok()).unwrap_or(0),
+                summary: f.next().unwrap_or_default().to_owned(),
+                path: String::new(),
+            };
+            c.path = lines.rfind(|l| !l.trim().is_empty())?.to_owned();
+            Some(c)
+        })
+        .collect()
+}
+
+/// One line of `git blame`: who last changed it, in which commit.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BlameLine {
+    pub hash: String,
+    pub author: String,
+    pub email: String,
+    pub time: i64,
+    pub summary: String,
+    pub text: String,
+}
+
+impl BlameLine {
+    /// Lines changed in the working tree and not committed yet.
+    pub fn uncommitted(&self) -> bool {
+        self.hash.bytes().all(|b| b == b'0')
+    }
+}
+
+/// `git blame` of `path`, as of `rev` (the working tree when `None`).
+pub fn blame(repo: &Path, rev: Option<&str>, path: &str) -> Result<Vec<BlameLine>, String> {
+    let mut args = vec!["blame", "--porcelain"];
+    if let Some(rev) = rev {
+        args.push(rev);
+    }
+    args.extend(["--", path]);
+    Ok(parse_blame(&run(Some(repo), &args)?))
+}
+
+fn parse_blame(out: &str) -> Vec<BlameLine> {
+    use std::collections::HashMap;
+    // The porcelain format describes each commit once, the first time it shows up.
+    let mut known: HashMap<String, BlameLine> = HashMap::new();
+    let mut lines = Vec::new();
+    let mut current: Option<BlameLine> = None;
+    for line in out.lines() {
+        if let Some(text) = line.strip_prefix('\t') {
+            if let Some(mut c) = current.take() {
+                known.entry(c.hash.clone()).or_insert_with(|| c.clone());
+                c.text = text.to_owned();
+                lines.push(c);
+            }
+            continue;
+        }
+        let Some(c) = current.as_mut() else {
+            let hash = line.split(' ').next().unwrap_or_default();
+            if hash.len() == 40 {
+                current = Some(known.get(hash).cloned().unwrap_or_else(|| BlameLine {
+                    hash: hash.to_owned(),
+                    ..BlameLine::default()
+                }));
+            }
+            continue;
+        };
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        match key {
+            "author" => c.author = value.to_owned(),
+            "author-mail" => c.email = value.trim_matches(['<', '>']).to_owned(),
+            "author-time" => c.time = value.parse().unwrap_or(0),
+            "summary" => c.summary = value.to_owned(),
+            _ => {}
+        }
+    }
+    lines
+}
+
 /// "3 minutes ago", "2 days ago"… for `time` seen from `now` (both Unix seconds).
 pub fn relative_time(time: i64, now: i64) -> String {
     let secs = (now - time).max(0);
@@ -819,6 +1070,64 @@ pub fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gitignore_lines() {
+        assert_eq!(gitignore_with("", "/a.log").as_deref(), Some("/a.log\n"));
+        assert_eq!(
+            gitignore_with("target\n", "*.log").as_deref(),
+            Some("target\n*.log\n")
+        );
+        // No trailing newline, CRLF kept.
+        assert_eq!(
+            gitignore_with("a\r\nb", "c").as_deref(),
+            Some("a\r\nb\r\nc\r\n")
+        );
+        assert_eq!(gitignore_with("x\n*.log\n", "*.log"), None);
+    }
+
+    #[test]
+    fn file_history_follows_renames() {
+        let out = format!(
+            "{RS}aaa{FS}Ann{FS}ann@x{FS}200{FS}Rename\n\nsrc/new.rs\n{RS}bbb{FS}Bob{FS}bob@x{FS}100{FS}Add\n\nold.rs\n"
+        );
+        let h = parse_file_history(&out);
+        assert_eq!(h.len(), 2);
+        assert_eq!(
+            (h[0].hash.as_str(), h[0].path.as_str()),
+            ("aaa", "src/new.rs")
+        );
+        assert_eq!(
+            (h[1].author.as_str(), h[1].time, h[1].path.as_str()),
+            ("Bob", 100, "old.rs")
+        );
+    }
+
+    #[test]
+    fn blame_reuses_commit_headers() {
+        let a = "a".repeat(40);
+        let z = "0".repeat(40);
+        let out = format!(
+            "{a} 1 1 2\nauthor Ann\nauthor-mail <ann@x>\nauthor-time 100\nsummary First\nfilename f\n\tone\n\
+             {a} 2 2\n\ttwo\n\
+             {z} 3 3 1\nauthor Not Committed Yet\nauthor-mail <not.committed.yet>\nauthor-time 200\nsummary Version of f from f\nfilename f\n\tthree\n"
+        );
+        let b = parse_blame(&out);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            (
+                b[0].author.as_str(),
+                b[0].email.as_str(),
+                b[0].text.as_str()
+            ),
+            ("Ann", "ann@x", "one")
+        );
+        assert_eq!(
+            (b[1].summary.as_str(), b[1].time, b[1].text.as_str()),
+            ("First", 100, "two")
+        );
+        assert!(!b[1].uncommitted() && b[2].uncommitted());
+    }
 
     #[test]
     fn status_sides_renames_and_conflicts() {
