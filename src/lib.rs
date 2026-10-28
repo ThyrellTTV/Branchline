@@ -2,6 +2,7 @@
 
 pub mod app;
 mod avatars;
+mod desktop_entry;
 mod forge;
 mod git;
 mod graph;

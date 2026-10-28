@@ -9,6 +9,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("gitcraft")
+            // Matches gitcraft.desktop, so Linux desktops show its icon and group its windows.
+            .with_app_id("gitcraft")
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([800.0, 500.0])
             .with_icon(app::window_icon()),

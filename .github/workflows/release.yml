@@ -81,6 +81,26 @@ jobs:
           sudo chmod +x /usr/local/bin/appimagetool
           sh packaging/linux/build-appimage.sh "gitcraft-${{ github.ref_name }}-${{ matrix.name }}.AppImage"
 
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: deb and rpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
+          strip target/release/gitcraft
+          cargo deb --no-build --output "$name.deb"
+          cargo generate-rpm --output "$name.rpm"
+          # The .deb installs, with its menu entry and icon; the .rpm holds the same files.
+          sudo apt-get install -y desktop-file-utils rpm "./$name.deb"
+          desktop-file-validate /usr/share/applications/gitcraft.desktop
+          test -x /usr/bin/gitcraft
+          test -f /usr/share/icons/hicolor/256x256/apps/gitcraft.png
+          rpm -qp --requires "$name.rpm"
+          rpm -qlp "$name.rpm"
+
       - uses: actions/upload-artifact@v4
         with:
           name: gitcraft-${{ matrix.name }}
@@ -89,6 +109,8 @@ jobs:
             gitcraft-*.tar.gz
             gitcraft-*-setup.exe
             gitcraft-*.AppImage
+            gitcraft-*.deb
+            gitcraft-*.rpm
 
   release:
     needs: build

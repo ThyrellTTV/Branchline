@@ -181,24 +181,26 @@ impl RepoTab {
                     continue;
                 };
                 if commit.hash == WIP_HASH {
-                    resp.context_menu(|ui| {
-                        if ui
-                            .add_enabled(idle, egui::Button::new("Stage all changes"))
-                            .clicked()
-                        {
-                            acts.push(Action::Ops {
-                                label: "Stage all".into(),
-                                ops: ops(&[&["add", "-A"]]),
-                                refresh: Refresh::Status,
-                            });
-                        }
-                        if ui
-                            .add_enabled(idle, egui::Button::new("Stash changes…"))
-                            .clicked()
-                        {
-                            acts.push(Action::Dialog(Dialog::stash()));
-                        }
-                    });
+                    egui::Popup::context_menu(&resp)
+                        .style(crate::theme::menu_style)
+                        .show(|ui| {
+                            if ui
+                                .add_enabled(idle, egui::Button::new("Stage all changes"))
+                                .clicked()
+                            {
+                                acts.push(Action::Ops {
+                                    label: "Stage all".into(),
+                                    ops: ops(&[&["add", "-A"]]),
+                                    refresh: Refresh::Status,
+                                });
+                            }
+                            if ui
+                                .add_enabled(idle, egui::Button::new("Stash changes…"))
+                                .clicked()
+                            {
+                                acts.push(Action::Dialog(Dialog::stash()));
+                            }
+                        });
                     continue;
                 }
                 self.commit_menu(&resp, i, idle, acts);
@@ -239,7 +241,7 @@ impl RepoTab {
             .current
             .clone()
             .unwrap_or_else(|| "HEAD".to_owned());
-        resp.context_menu(|ui| {
+        egui::Popup::context_menu(resp).style(crate::theme::menu_style).show(|ui| {
             if let Some(branch) = &pill
                 && self.refs.current.as_deref() != Some(branch.as_str())
             {

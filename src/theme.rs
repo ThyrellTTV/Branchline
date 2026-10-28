@@ -242,6 +242,32 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// Menus and context menus: no border, rows highlighted from edge to edge with room for the
+/// text, a margin only above and below (where the menu's corners are rounded).
+pub fn menu_style(s: &mut egui::Style) {
+    s.spacing.menu_margin = egui::Margin::symmetric(0, 6);
+    s.spacing.button_padding = egui::vec2(16.0, 7.0);
+    s.spacing.item_spacing.y = 0.0;
+    s.visuals.window_stroke = Stroke::NONE;
+    // A shade darker than cards on dark themes, with lighter separators.
+    let fill = s.visuals.window_fill;
+    let (fill, line) = if s.visuals.dark_mode {
+        let fill = fill.lerp_to_gamma(Color32::BLACK, 0.3);
+        (fill, fill.lerp_to_gamma(Color32::WHITE, 0.2))
+    } else {
+        (fill, fill.lerp_to_gamma(Color32::BLACK, 0.15))
+    };
+    s.visuals.window_fill = fill;
+    s.visuals.popup_shadow.color = s.visuals.popup_shadow.color.gamma_multiply(0.6);
+    s.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, line);
+    let w = &mut s.visuals.widgets;
+    w.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    for wv in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+        wv.bg_stroke = Stroke::NONE;
+        wv.corner_radius = CornerRadius::ZERO;
+    }
+}
+
 pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
     let t = Tokens::for_kind(kind);
     ctx.data_mut(|d| d.insert_temp(tokens_id(), t));
@@ -261,7 +287,7 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
     v.warn_fg_color = t.warning;
     v.error_fg_color = t.danger;
     v.window_corner_radius = CornerRadius::same(t.radius_lg as u8);
-    v.menu_corner_radius = CornerRadius::same(t.radius as u8);
+    v.menu_corner_radius = CornerRadius::same(t.radius_lg as u8);
     v.window_shadow = egui::Shadow {
         offset: [0, 10],
         blur: 32,

@@ -31,9 +31,11 @@ impl RepoTab {
         widgets::panel_header(ui, title, |ui| {
             if let Some(stash) = &stash {
                 let more = icons::small_button(ui, "chevron-down", "Apply, pop or drop");
-                egui::Popup::menu(&more).show(|ui| {
-                    super::sidebar::stash_menu_items(ui, acts, &stash.name, idle);
-                });
+                egui::Popup::menu(&more)
+                    .style(crate::theme::menu_style)
+                    .show(|ui| {
+                        super::sidebar::stash_menu_items(ui, acts, &stash.name, idle);
+                    });
             }
         });
         if let Some(stash) = &stash {
@@ -508,17 +510,21 @@ impl RepoTab {
             let profiles = crate::settings::Settings::get(ui.ctx()).profiles;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let b = icons::small_button(ui, "user-round", "Commit as…");
-                egui::Popup::menu(&b).show(|ui| {
-                    if profiles.is_empty() {
-                        ui.label(RichText::new("Add identities in Settings").color(t.text_faint));
-                    }
-                    for p in &profiles {
-                        let label = format!("{} — {} <{}>", p.label, p.name, p.email);
-                        if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
-                            acts.push(Action::SetIdentity(p.name.clone(), p.email.clone()));
+                egui::Popup::menu(&b)
+                    .style(crate::theme::menu_style)
+                    .show(|ui| {
+                        if profiles.is_empty() {
+                            ui.label(
+                                RichText::new("Add identities in Settings").color(t.text_faint),
+                            );
                         }
-                    }
-                });
+                        for p in &profiles {
+                            let label = format!("{} — {} <{}>", p.label, p.name, p.email);
+                            if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
+                                acts.push(Action::SetIdentity(p.name.clone(), p.email.clone()));
+                            }
+                        }
+                    });
             });
         });
     }

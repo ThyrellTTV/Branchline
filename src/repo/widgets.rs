@@ -455,27 +455,31 @@ pub fn terminal_tabs(
             cwd: None,
         });
     }
-    egui::Popup::context_menu(&plus).show(|ui| {
-        for shell in crate::terminal::available_shells() {
-            if ui.button(&shell.label).clicked() {
-                acts.push(super::Action::NewTerminal {
-                    shell: Some(shell),
-                    cwd: None,
-                });
+    egui::Popup::context_menu(&plus)
+        .style(crate::theme::menu_style)
+        .show(|ui| {
+            for shell in crate::terminal::available_shells() {
+                if ui.button(&shell.label).clicked() {
+                    acts.push(super::Action::NewTerminal {
+                        shell: Some(shell),
+                        cwd: None,
+                    });
+                }
             }
-        }
-    });
+        });
     let more = icons::small_button(ui, "chevron-down", "New terminal with…");
-    egui::Popup::menu(&more).show(|ui| {
-        for shell in crate::terminal::available_shells() {
-            if ui.button(&shell.label).clicked() {
-                acts.push(super::Action::NewTerminal {
-                    shell: Some(shell),
-                    cwd: None,
-                });
+    egui::Popup::menu(&more)
+        .style(crate::theme::menu_style)
+        .show(|ui| {
+            for shell in crate::terminal::available_shells() {
+                if ui.button(&shell.label).clicked() {
+                    acts.push(super::Action::NewTerminal {
+                        shell: Some(shell),
+                        cwd: None,
+                    });
+                }
             }
-        }
-    });
+        });
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         ui.add_space(4.0);
         if icons::small_button(ui, "x", "Hide the panel (shells keep running)").clicked() {
@@ -496,51 +500,53 @@ pub fn file_menu(
 ) {
     use super::Action;
     use super::file_view::FileTab;
-    resp.context_menu(|ui| {
-        let rel = std::path::PathBuf::from(path);
-        if ui.button("Open file").clicked() {
-            acts.push(Action::OpenPath(rel.clone()));
-        }
-        if ui.button("Open in editor").clicked() {
-            acts.push(Action::OpenInEditor(rel.clone()));
-        }
-        if ui.button(super::reveal_label()).clicked() {
-            acts.push(Action::OpenPath(
-                rel.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-            ));
-        }
-        ui.separator();
-        if ui.button("File history").clicked() {
-            acts.push(Action::FileView {
-                path: path.to_owned(),
-                rev: rev.map(str::to_owned),
-                tab: FileTab::History,
-            });
-        }
-        if ui.button("Blame").clicked() {
-            acts.push(Action::FileView {
-                path: path.to_owned(),
-                rev: rev.map(str::to_owned),
-                tab: FileTab::Blame,
-            });
-        }
-        if ignorable {
-            ui.menu_button("Ignore", |ui| {
-                for (label, pattern, untrack) in ignore_patterns(path) {
-                    if ui.button(label).clicked() {
-                        acts.push(Action::Ignore {
-                            pattern,
-                            path: untrack,
-                        });
+    egui::Popup::context_menu(resp)
+        .style(crate::theme::menu_style)
+        .show(|ui| {
+            let rel = std::path::PathBuf::from(path);
+            if ui.button("Open file").clicked() {
+                acts.push(Action::OpenPath(rel.clone()));
+            }
+            if ui.button("Open in editor").clicked() {
+                acts.push(Action::OpenInEditor(rel.clone()));
+            }
+            if ui.button(super::reveal_label()).clicked() {
+                acts.push(Action::OpenPath(
+                    rel.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
+                ));
+            }
+            ui.separator();
+            if ui.button("File history").clicked() {
+                acts.push(Action::FileView {
+                    path: path.to_owned(),
+                    rev: rev.map(str::to_owned),
+                    tab: FileTab::History,
+                });
+            }
+            if ui.button("Blame").clicked() {
+                acts.push(Action::FileView {
+                    path: path.to_owned(),
+                    rev: rev.map(str::to_owned),
+                    tab: FileTab::Blame,
+                });
+            }
+            if ignorable {
+                ui.menu_button("Ignore", |ui| {
+                    for (label, pattern, untrack) in ignore_patterns(path) {
+                        if ui.button(label).clicked() {
+                            acts.push(Action::Ignore {
+                                pattern,
+                                path: untrack,
+                            });
+                        }
                     }
-                }
-            });
-        }
-        ui.separator();
-        if ui.button("Copy path").clicked() {
-            ui.ctx().copy_text(path.to_owned());
-        }
-    });
+                });
+            }
+            ui.separator();
+            if ui.button("Copy path").clicked() {
+                ui.ctx().copy_text(path.to_owned());
+            }
+        });
 }
 
 /// The ways to ignore `path`: (menu label, `.gitignore` line, what to stop tracking).

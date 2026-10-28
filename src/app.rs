@@ -124,6 +124,7 @@ impl App {
         theme::install_fonts(ctx);
         theme::apply(ctx, saved.theme);
         saved.settings.set(ctx);
+        crate::desktop_entry::refresh();
 
         let mut app = Self {
             git_version: git::version(),
@@ -408,40 +409,44 @@ impl App {
                         .fill(t.accent)
                         .corner_radius(10.0),
                     );
-                    egui::Popup::menu(&pill).show(|ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "gitcraft {} is out (you have {}).",
-                                release.version,
-                                update::CURRENT
-                            ))
-                            .color(t.text_dim),
-                        );
-                        if ui.button("Open the release page").clicked() {
-                            let _ = open::that_detached(&release.url);
-                        }
-                        if ui.button("Skip this version").clicked() {
-                            self.skipped_version = release.version.clone();
-                            self.update = None;
-                        }
-                    });
+                    egui::Popup::menu(&pill)
+                        .style(crate::theme::menu_style)
+                        .show(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "gitcraft {} is out (you have {}).",
+                                    release.version,
+                                    update::CURRENT
+                                ))
+                                .color(t.text_dim),
+                            );
+                            if ui.button("Open the release page").clicked() {
+                                let _ = open::that_detached(&release.url);
+                            }
+                            if ui.button("Skip this version").clicked() {
+                                self.skipped_version = release.version.clone();
+                                self.update = None;
+                            }
+                        });
                 }
                 if icons::small_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
                     self.open_palette();
                 }
                 let resp = icons::small_button(ui, "palette", "Theme");
-                egui::Popup::menu(&resp).show(|ui| {
-                    ui.label(
-                        RichText::new("THEME")
-                            .font(theme::semibold(10.5))
-                            .color(t.text_faint),
-                    );
-                    for kind in ThemeKind::ALL {
-                        if ui.radio(self.theme == kind, kind.label()).clicked() {
-                            self.set_theme(ui.ctx(), kind);
+                egui::Popup::menu(&resp)
+                    .style(crate::theme::menu_style)
+                    .show(|ui| {
+                        ui.label(
+                            RichText::new("THEME")
+                                .font(theme::semibold(10.5))
+                                .color(t.text_faint),
+                        );
+                        for kind in ThemeKind::ALL {
+                            if ui.radio(self.theme == kind, kind.label()).clicked() {
+                                self.set_theme(ui.ctx(), kind);
+                            }
                         }
-                    }
-                });
+                    });
             });
         });
         if let Some(i) = select {
@@ -478,6 +483,17 @@ impl App {
                             icons::inline(ui, "check", 14.0, t.success);
                             ui.label(RichText::new(v).color(t.text_dim));
                         });
+                    }
+                    if let Some(appimage) = crate::desktop_entry::appimage()
+                        && !crate::desktop_entry::installed()
+                    {
+                        ui.add_space(4.0);
+                        let link = ui
+                            .link("Add gitcraft to the applications menu")
+                            .on_hover_text(appimage.display().to_string());
+                        if link.clicked() {
+                            self.error = crate::desktop_entry::install(&appimage).err();
+                        }
                     }
                     ui.add_space(26.0);
 

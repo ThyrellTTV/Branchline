@@ -133,6 +133,24 @@ impl Settings {
             ui.label("Notifications");
             ui.checkbox(&mut self.notifications, "When a long operation ends in the background");
             ui.end_row();
+            if let Some(appimage) = crate::desktop_entry::appimage() {
+                ui.label("Applications menu");
+                ui.horizontal(|ui| {
+                    if crate::desktop_entry::installed() {
+                        if ui.button("Remove gitcraft").clicked() {
+                            let _ = crate::desktop_entry::uninstall();
+                        }
+                    } else if ui.button("Add gitcraft").clicked() {
+                        let _ = crate::desktop_entry::install(&appimage);
+                    }
+                    ui.label(
+                        RichText::new("Starts this AppImage; follows it when you replace it")
+                            .color(t.text_faint)
+                            .small(),
+                    );
+                });
+                ui.end_row();
+            }
             ui.label("Updates");
             ui.checkbox(&mut self.check_updates, "Check GitHub for a new version once a day");
             ui.end_row();

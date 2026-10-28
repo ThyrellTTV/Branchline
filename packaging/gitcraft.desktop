@@ -6,3 +6,4 @@ Exec=gitcraft %f
 Terminal=false
 Categories=Development;RevisionControl;
 Icon=gitcraft
+StartupWMClass=gitcraft

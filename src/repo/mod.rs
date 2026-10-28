@@ -1821,17 +1821,19 @@ impl RepoTab {
             }
             let open =
                 icons::tool_button(ui, "external-link", "", true).on_hover_text("Open the folder…");
-            egui::Popup::menu(&open).show(|ui| {
-                if ui.button(reveal_label()).clicked() {
-                    acts.push(Action::OpenPath(PathBuf::new()));
-                }
-                if ui.button("Open in editor").clicked() {
-                    acts.push(Action::OpenInEditor(PathBuf::new()));
-                }
-                if ui.button("Copy path").clicked() {
-                    ui.ctx().copy_text(self.path.display().to_string());
-                }
-            });
+            egui::Popup::menu(&open)
+                .style(crate::theme::menu_style)
+                .show(|ui| {
+                    if ui.button(reveal_label()).clicked() {
+                        acts.push(Action::OpenPath(PathBuf::new()));
+                    }
+                    if ui.button("Open in editor").clicked() {
+                        acts.push(Action::OpenInEditor(PathBuf::new()));
+                    }
+                    if ui.button("Copy path").clicked() {
+                        ui.ctx().copy_text(self.path.display().to_string());
+                    }
+                });
             widgets::toolbar_separator(ui);
             if icons::tool_button(ui, "refresh-cw", "", !self.loading)
                 .on_hover_text("Reload (F5)")

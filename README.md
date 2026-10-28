@@ -104,12 +104,18 @@ Ready-made builds for Windows and Linux (x86-64) are on the
 - **Windows:** `gitcraft-…-setup.exe` installs it for your user (no administrator rights), with a
   Start menu entry, an optional desktop icon, *Open in gitcraft* on folders and an uninstaller.
   The `.zip` is the same program without installing.
-- **Linux:** `gitcraft-….AppImage` runs on most distributions: make it executable
-  (`chmod +x`) and run it. The `.tar.gz` holds the bare binary and a `.desktop` file.
+- **Linux:** `gitcraft-….deb` (Debian, Ubuntu, Mint…) and `gitcraft-….rpm` (Fedora, openSUSE…)
+  install it with its applications menu entry, from the software centre or with
+  `sudo apt install ./gitcraft-….deb` / `sudo dnf install ./gitcraft-….rpm`.
+  `gitcraft-….AppImage` runs on any distribution: make it executable (`chmod +x`) and run it;
+  *Add gitcraft to the applications menu* on its start page (or in Settings) adds a menu entry,
+  which follows the AppImage when you replace it with a newer one. The `.tar.gz` holds the bare
+  binary and a `.desktop` file.
 
 A release is built by `.github/workflows/release.yml` whenever a `v*` tag is pushed
 (`packaging/windows/gitcraft.iss` for the installer, `packaging/linux/build-appimage.sh` for the
-AppImage).
+AppImage, `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in `Cargo.toml` for the
+packages).
 
 ## Build and run
 
@@ -144,6 +150,7 @@ was made this way, on a demo repository.
 | `src/forge.rs` | pull / merge requests through `gh` and `glab` |
 | `src/avatars.rs` | avatars from GitHub, GitLab or Gravatar, cached on disk |
 | `src/update.rs` | new-release check |
+| `src/desktop_entry.rs` | applications menu entry for the AppImage |
 | `src/settings.rs` | user settings and their form |
 | `src/theme.rs` | colour tokens, fonts, egui style (PhotoCraft's Pro themes) |
 | `src/icons.rs` | embedded Lucide SVG icons, tinted |
