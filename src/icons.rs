@@ -93,6 +93,17 @@ pub fn paint(ui: &Ui, rect: Rect, name: &str, size: f32, tint: Color32) {
 /// A flat toolbar button: icon plus optional label, background only on hover (PhotoCraft's
 /// options-bar buttons).
 pub fn tool_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> Response {
+    tool_button_count(ui, icon, label, 0, enabled)
+}
+
+/// A toolbar button with `count` in a circle after its label (none when 0).
+pub fn tool_button_count(
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    count: u32,
+    enabled: bool,
+) -> Response {
     // Painted by hand at a fixed size: egui's button adds its border's width only while the
     // frame shows, so hovering one pushed the rest of the toolbar sideways.
     const PAD: f32 = 10.0;
@@ -105,8 +116,23 @@ pub fn tool_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> Respo
         let font = egui::TextStyle::Button.resolve(ui.style());
         ui.painter().layout_no_wrap(label.to_owned(), font, color)
     });
+    const BADGE: f32 = 16.0;
+    let badge = (count > 0).then(|| {
+        let text = if count > 99 {
+            "99+".to_owned()
+        } else {
+            count.to_string()
+        };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text, crate::theme::semibold(10.0), t.accent_text);
+        // A circle for one digit, stretched into a pill for more.
+        let width = (galley.size().x + 8.0).max(BADGE);
+        (galley, width)
+    });
+    let badge_width = badge.as_ref().map_or(0.0, |(_, w)| GAP + w);
     let width = match &galley {
-        Some(g) => PAD + ICON + GAP + g.size().x + PAD,
+        Some(g) => PAD + ICON + GAP + g.size().x + badge_width + PAD,
         None => 28.0,
     };
     ui.add_enabled(enabled, |ui: &mut Ui| {
@@ -135,7 +161,18 @@ pub fn tool_button(ui: &mut Ui, icon: &str, label: &str, enabled: bool) -> Respo
         paint(ui, icon_rect, icon, ICON, tint);
         if let Some(g) = galley {
             let pos = egui::pos2(icon_rect.right() + GAP, rect.center().y - g.size().y / 2.0);
+            let text_right = pos.x + g.size().x;
             ui.painter().galley(pos, g, color);
+            if let Some((count, w)) = badge {
+                let pill = Rect::from_min_size(
+                    egui::pos2(text_right + GAP, rect.center().y - BADGE / 2.0),
+                    Vec2::new(w, BADGE),
+                );
+                let fill = if enabled { t.accent } else { t.text_faint };
+                ui.painter().rect_filled(pill, BADGE / 2.0, fill);
+                ui.painter()
+                    .galley(pill.center() - count.size() / 2.0, count, t.accent_text);
+            }
         }
         resp
     })

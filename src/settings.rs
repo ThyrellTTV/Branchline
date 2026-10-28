@@ -38,6 +38,8 @@ pub struct Settings {
     pub notifications: bool,
     /// Ask GitHub once a day whether a newer release exists.
     pub check_updates: bool,
+    /// Colour code in diffs and blame with VS Code's current theme, when it has one.
+    pub vscode_colors: bool,
     pub profiles: Vec<Profile>,
 }
 
@@ -56,6 +58,7 @@ impl Default for Settings {
             editor: "code".to_owned(),
             notifications: true,
             check_updates: true,
+            vscode_colors: true,
             profiles: Vec::new(),
         }
     }
@@ -74,6 +77,7 @@ impl Settings {
     pub fn set(&self, ctx: &egui::Context) {
         ctx.data_mut(|d| d.insert_temp(id(), self.clone()));
         ctx.set_zoom_factor(self.ui_scale.clamp(0.7, 2.0));
+        crate::vscode_theme::set_enabled(self.vscode_colors);
     }
 
     /// The settings form. Returns true when something changed.
@@ -108,6 +112,23 @@ impl Settings {
             ui.label("Avatars");
             ui.checkbox(&mut self.avatars, "Load from GitHub, GitLab or Gravatar")
                 .on_hover_text("On a GitHub repository, its commit list says which account each author is; on GitLab, the host is asked by email. Other authors: an MD5 hash of the email goes to gravatar.com. Cached on disk.");
+            ui.end_row();
+            ui.label("Code colours");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.vscode_colors, "Use VS Code's colour theme");
+                if self.vscode_colors {
+                    let note = match crate::vscode_theme::current() {
+                        Some(found) if found.dark == t.dark() => found.name.clone(),
+                        Some(found) => format!(
+                            "{} is {}: gitcraft's colours meanwhile",
+                            found.name,
+                            if found.dark { "dark" } else { "light" }
+                        ),
+                        None => "No VS Code theme found".to_owned(),
+                    };
+                    ui.label(RichText::new(note).color(t.text_faint).small());
+                }
+            });
             ui.end_row();
             ui.label("Notifications");
             ui.checkbox(&mut self.notifications, "When a long operation ends in the background");

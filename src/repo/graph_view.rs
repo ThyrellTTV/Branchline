@@ -19,6 +19,8 @@ use crate::theme::{self, Tokens};
 const ROW_H: f32 = 28.0;
 const LANE_W: f32 = 16.0;
 const MAX_LANES_SHOWN: usize = 24;
+/// How much darker the pills that are not checked out are (0 = same colour, 1 = black).
+const DIMMED: f32 = 0.4;
 const AUTHOR_W: f32 = 150.0;
 const DATE_W: f32 = 118.0;
 const HASH_W: f32 = 70.0;
@@ -638,7 +640,7 @@ impl RepoTab {
                     CornerRadius::same(t.radius as u8),
                     row_color
                         .lerp_to_gamma(Color32::BLACK, 0.35)
-                        .gamma_multiply(0.6),
+                        .lerp_to_gamma(Color32::BLACK, DIMMED),
                 );
                 rp.text(
                     r.center(),
@@ -968,11 +970,11 @@ fn ref_pill(
         BadgeKind::Tag => Color32::from_rgb(104, 104, 112),
         BadgeKind::DetachedHead => t.warning,
     };
-    // Every pill but the checked-out one is a little see-through.
+    // Every pill but the checked-out one is a darker shade of its colour.
     let fill = if badge.head {
         fill
     } else {
-        fill.gamma_multiply(0.6)
+        fill.lerp_to_gamma(Color32::BLACK, DIMMED)
     };
     let mut lead = Vec::new();
     let mut trail = Vec::new();

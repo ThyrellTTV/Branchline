@@ -1770,26 +1770,19 @@ impl RepoTab {
                 .and_then(|c| self.refs.local.iter().find(|b| &b.name == c))
                 .map(|b| b.ahead_behind())
                 .unwrap_or((0, 0));
-            let pull_label = if behind > 0 {
-                format!("Pull {behind}")
-            } else {
-                "Pull".to_owned()
-            };
-            let pull =
-                icons::tool_button(ui, "arrow-down-to-line", &pull_label, idle && has_remote)
-                    .on_hover_text("Fast-forward the current branch (git pull --ff-only)");
-            if behind > 0 {
-                widgets::count_badge(ui, pull.rect, t.accent);
-            }
-            if pull.clicked() {
+            if icons::tool_button_count(
+                ui,
+                "arrow-down-to-line",
+                "Pull",
+                behind,
+                idle && has_remote,
+            )
+            .on_hover_text("Fast-forward the current branch (git pull --ff-only)")
+            .clicked()
+            {
                 acts.push(Action::Pull);
             }
-            let push_label = if ahead > 0 {
-                format!("Push {ahead}")
-            } else {
-                "Push".to_owned()
-            };
-            if icons::tool_button(ui, "arrow-up-from-line", &push_label, idle && has_remote)
+            if icons::tool_button_count(ui, "arrow-up-from-line", "Push", ahead, idle && has_remote)
                 .on_hover_text("Push the current branch (publishes it if it has no upstream yet)")
                 .clicked()
             {

@@ -41,12 +41,19 @@ pub fn highlight<'a>(
     if syntax.name == "Plain Text" {
         return None;
     }
-    let theme_name = if dark {
-        "base16-ocean.dark"
-    } else {
-        "InspiredGitHub"
+    // VS Code's theme when it suits the background: a dark theme on a light gitcraft reads badly.
+    let editor = crate::vscode_theme::enabled()
+        .then(crate::vscode_theme::current)
+        .flatten()
+        .filter(|e| e.dark == dark);
+    let theme = match &editor {
+        Some(e) => &e.theme,
+        None => themes().themes.get(if dark {
+            "base16-ocean.dark"
+        } else {
+            "InspiredGitHub"
+        })?,
     };
-    let theme = themes().themes.get(theme_name)?;
     let mut h = HighlightLines::new(syntax, theme);
     let mut out = Vec::new();
     for line in lines {

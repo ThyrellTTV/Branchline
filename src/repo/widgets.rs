@@ -368,12 +368,6 @@ fn name_hash(name: &str) -> usize {
         .fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
 }
 
-/// A dot on the top-right corner of a toolbar button (incoming commits…).
-pub fn count_badge(ui: &Ui, button: Rect, color: Color32) {
-    ui.painter()
-        .circle_filled(button.right_top() + vec2(-5.0, 6.0), 3.5, color);
-}
-
 /// The accent line under an active toolbar toggle.
 pub fn active_underline(ui: &Ui, button: Rect, color: Color32) {
     ui.painter().line_segment(

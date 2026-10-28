@@ -23,7 +23,7 @@ so your config, credentials and hooks apply as usual.
   it at that commit (`x` and `origin/x` make one pill), a pull-request icon when one is open,
   `+N` when more refs share the commit, the author's avatar and how long ago it was ("2 hours
   ago"). Author, date and hash columns are optional (Settings).
-- The checked-out branch's pill is solid, the others slightly see-through. Double-click a pill to
+- The checked-out branch's pill is solid, the others a darker shade. Double-click a pill to
   check that branch (or tag) out; hover `+N` to list every pill of the commit and double-click
   the one you want.
 - An *Uncommitted changes* row on top while the working tree is dirty.
@@ -64,6 +64,8 @@ so your config, credentials and hooks apply as usual.
 **Diffs and conflicts** (centre)
 - Unified or side by side, syntax colours, the changed part of each line marked, whitespace
   changes optional, images shown before / after. Esc closes.
+- Code takes the colours of the theme VS Code (or Insiders, VSCodium) is using, read from its
+  settings and extensions, when it is dark or light like gitcraft's; a setting turns it off.
 - Conflicts open in a three-pane editor: each conflict's two sides with *Ours*, *Theirs* and
   *Both* buttons, and the result below (editable). *Use mine* / *Use theirs* for a whole file.
 - A merge, rebase, cherry-pick or revert stopped on conflicts shows a banner with *Abort*; the
@@ -152,6 +154,7 @@ was made this way, on a demo repository.
 | `src/repo/detail.rs` | commit / stash detail, changes and commit box |
 | `src/repo/diff.rs` | diff loading, pairing and the diff view (unified, split, images) |
 | `src/repo/highlight.rs` | syntax colours (syntect) |
+| `src/vscode_theme.rs` | VS Code's current colour theme as a syntect theme |
 | `src/repo/conflict.rs` | three-pane conflict editor |
 | `src/repo/rebase.rs` | interactive rebase editor and its todo list |
 | `src/repo/file_view.rs` | a file's history and blame |
