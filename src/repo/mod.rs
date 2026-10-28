@@ -55,6 +55,8 @@ enum Msg {
         result: Result<Vec<git::RebaseCommit>, String>,
     },
     Search(String, Result<Vec<String>, String>),
+    /// A comparison's files, for the request numbered so.
+    Compare(u64, Result<CompareData, String>),
     Prs(Result<Vec<PullRequest>, String>),
     OpDone {
         label: String,
@@ -127,19 +129,87 @@ enum OpKind {
 /// Which diff the central area shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiffKey {
-    Commit { hash: String, path: String },
+    Commit {
+        hash: String,
+        path: String,
+    },
     Work(StatusFile),
+    /// A file from one commit to another, or to the working tree (`to: None`).
+    Range {
+        from: String,
+        to: Option<String>,
+        path: String,
+    },
 }
 
 pub(crate) struct DiffView {
     key: DiffKey,
     data: Option<Result<diff::DiffData, String>>,
+    /// Changed lines clicked, to stage, unstage or discard only those.
+    chosen: std::collections::BTreeSet<usize>,
+    /// The last line clicked, where a Shift+click range starts.
+    anchor: Option<usize>,
+}
+
+impl DiffView {
+    fn new(key: DiffKey) -> Self {
+        Self {
+            key,
+            data: None,
+            chosen: Default::default(),
+            anchor: None,
+        }
+    }
+}
+
+/// Two points of history side by side in the right pane: a branch against another, a commit
+/// against the working tree…
+pub(crate) struct Compare {
+    base: String,
+    base_label: String,
+    /// `None`: the working tree.
+    target: Option<String>,
+    target_label: String,
+    /// Only what the target changed since the two diverged (from their merge base), like a pull
+    /// request shows it.
+    since_fork: bool,
+    data: Option<Result<CompareData, String>>,
+    /// Numbers the requests, so an older answer doesn't replace a newer one.
+    request: u64,
+}
+
+pub(crate) struct CompareData {
+    /// Where the diff starts: the base's commit, or the merge base.
+    from: String,
+    /// The target's commit (`None`: the working tree).
+    to: Option<String>,
+    files: Vec<git::ChangedFile>,
+    /// Commits only the base has, and only the target (HEAD for the working tree) has.
+    apart: (u32, u32),
+}
+
+impl Compare {
+    /// How the comparison calls one of its two ends.
+    fn name_of(&self, rev: &str) -> Option<String> {
+        let data = self.data.as_ref()?.as_ref().ok()?;
+        if data.to.as_deref() == Some(rev) {
+            Some(self.target_label.clone())
+        } else if data.from == rev && self.since_fork {
+            Some(format!("merge base {}", short(rev)))
+        } else if data.from == rev {
+            Some(self.base_label.clone())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
 struct Search {
     open: bool,
     focus: bool,
+    /// Search what commits added or removed in files (`git log -S`), not their messages.
+    code: bool,
     query: String,
     /// The query the results are for.
     searched: String,
@@ -229,6 +299,25 @@ pub(crate) enum Action {
         pattern: String,
         path: String,
     },
+    /// Stage, unstage or discard these changed lines of the open diff.
+    PickLines {
+        pick: diff::Pick,
+        lines: std::collections::BTreeSet<usize>,
+    },
+    /// Compare `base` with `target` (the working tree when `None`) in the right pane.
+    Compare {
+        base: String,
+        base_label: String,
+        target: Option<String>,
+        target_label: String,
+        since_fork: bool,
+    },
+    /// Show only the target's changes since the two diverged, or every difference.
+    CompareSinceFork(bool),
+    SwapCompare,
+    CloseCompare,
+    /// Search commit messages, or what commits changed in files.
+    SearchCode(bool),
 }
 
 pub struct RepoTab {
@@ -267,6 +356,8 @@ pub struct RepoTab {
     detail: Option<CommitDetail>,
     detail_error: Option<String>,
     diff: Option<DiffView>,
+    compare: Option<Compare>,
+    compare_requests: u64,
     file_view: Option<file_view::FileView>,
     rebase: Option<rebase::RebaseEditor>,
     /// HTTPS credentials typed in this session, used for every later git command of the tab.
@@ -358,6 +449,8 @@ impl RepoTab {
             detail: None,
             detail_error: None,
             diff: None,
+            compare: None,
+            compare_requests: 0,
             file_view: None,
             rebase: None,
             credentials: None,
@@ -589,10 +682,15 @@ impl RepoTab {
                 .chain(&self.work.conflicted)
                 .any(|f| f == file);
             let key = DiffKey::Work(file.clone());
-            self.diff = None;
-            self.conflict = None;
-            if still {
-                self.open_diff(key, ctx);
+            if still && file.area != git::Area::Conflicted {
+                // Shown as it was until the new diff is read (no flicker after staging lines).
+                self.refresh_diff(ctx);
+            } else {
+                self.diff = None;
+                self.conflict = None;
+                if still {
+                    self.open_diff(key, ctx);
+                }
             }
         }
 
@@ -612,10 +710,11 @@ impl RepoTab {
         self.selected = Some(row);
         self.stash_view = None;
         self.file_view = None;
+        self.compare = None;
         if matches!(
             self.diff,
             Some(DiffView {
-                key: DiffKey::Commit { .. },
+                key: DiffKey::Commit { .. } | DiffKey::Range { .. },
                 ..
             })
         ) || hash != WIP_HASH
@@ -650,6 +749,7 @@ impl RepoTab {
         self.stash_view = Some(i);
         self.selected = None;
         self.file_view = None;
+        self.compare = None;
         self.diff = None;
         self.conflict = None;
         self.load_detail(hash, ctx);
@@ -701,16 +801,73 @@ impl RepoTab {
             }
             _ => None,
         };
-        self.diff = Some(DiffView {
-            key: key.clone(),
-            data: None,
-        });
+        self.diff = Some(DiffView::new(key));
+        self.refresh_diff(ctx);
+    }
+
+    /// Reads the open diff again, showing the old one meanwhile.
+    fn refresh_diff(&mut self, ctx: &egui::Context) {
+        let Some(view) = &self.diff else { return };
+        let key = view.key.clone();
         let path = self.path.clone();
         let ignore_ws = self.diff_ignore_ws;
         let dark = Tokens::get(ctx).dark();
         spawn(&self.tx, ctx, move || {
             let result = diff::load(&path, &key, ignore_ws, dark);
             Msg::Diff(key, result)
+        });
+    }
+
+    /// Starts comparing two points of history (replacing the comparison shown).
+    fn compare(&mut self, compare: Compare, ctx: &egui::Context) {
+        if matches!(
+            self.diff,
+            Some(DiffView {
+                key: DiffKey::Range { .. },
+                ..
+            })
+        ) {
+            self.diff = None;
+        }
+        self.file_view = None;
+        self.compare = Some(compare);
+        self.reload_compare(ctx);
+    }
+
+    /// Reads the comparison's files again (the working tree or a branch moved).
+    fn reload_compare(&mut self, ctx: &egui::Context) {
+        self.compare_requests += 1;
+        let request = self.compare_requests;
+        let Some(c) = &mut self.compare else { return };
+        c.request = request;
+        let (path, base, target, since_fork) = (
+            self.path.clone(),
+            c.base.clone(),
+            c.target.clone(),
+            c.since_fork,
+        );
+        spawn(&self.tx, ctx, move || {
+            let result = (|| {
+                let base = git::resolve(&path, &base)?;
+                let to = target.map(|t| git::resolve(&path, &t)).transpose()?;
+                // The working tree goes with HEAD's history.
+                let other = match &to {
+                    Some(to) => to.clone(),
+                    None => git::resolve(&path, "HEAD")?,
+                };
+                let from = if since_fork {
+                    git::merge_base(&path, &base, &other)?
+                } else {
+                    base.clone()
+                };
+                Ok(CompareData {
+                    files: git::diff_files(&path, &from, to.as_deref())?,
+                    apart: git::count_apart(&path, &base, &other)?,
+                    from,
+                    to,
+                })
+            })();
+            Msg::Compare(request, result)
         });
     }
 
@@ -1078,8 +1235,13 @@ impl RepoTab {
         }
         self.search.running = true;
         let path = self.path.clone();
+        let code = self.search.code;
         spawn(&self.tx, ctx, move || {
-            let result = git::search(&path, &query);
+            let result = if code {
+                git::search_code(&path, &query)
+            } else {
+                git::search(&path, &query)
+            };
             Msg::Search(query, result)
         });
     }
@@ -1207,6 +1369,7 @@ impl RepoTab {
                         }
                         self.rebuild(ctx);
                         self.hint_avatars(ctx);
+                        self.reload_compare(ctx);
                     }
                     Err(e) => self.load_error = Some(e),
                 }
@@ -1233,6 +1396,9 @@ impl RepoTab {
                 Ok(work) => {
                     self.work = work;
                     self.rebuild(ctx);
+                    if self.compare.as_ref().is_some_and(|c| c.target.is_none()) {
+                        self.reload_compare(ctx);
+                    }
                 }
                 Err(e) => self.status = Some((e, true)),
             },
@@ -1285,6 +1451,16 @@ impl RepoTab {
                     && view.key == key
                 {
                     view.data = Some(result);
+                    // The lines may have moved.
+                    view.chosen.clear();
+                    view.anchor = None;
+                }
+            }
+            Msg::Compare(request, result) => {
+                if let Some(c) = &mut self.compare
+                    && c.request == request
+                {
+                    c.data = Some(result);
                 }
             }
             Msg::Search(query, result) => {
@@ -1610,6 +1786,107 @@ impl RepoTab {
                     }
                 }
             },
+            Action::PickLines { pick, lines } => {
+                let Some(DiffView {
+                    key: DiffKey::Work(file),
+                    data: Some(Ok(data)),
+                    ..
+                }) = &self.diff
+                else {
+                    return;
+                };
+                let Some(patch) = diff::partial_patch(&data.header, &data.lines, &lines, pick)
+                else {
+                    return;
+                };
+                let patch = match git::save_patch(&patch) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        self.status = Some((e, true));
+                        return;
+                    }
+                };
+                let n = lines.len();
+                let label = format!(
+                    "{} {n} line{} of {}",
+                    pick.verb(),
+                    if n == 1 { "" } else { "s" },
+                    file.path
+                );
+                let mut args = pick.args().to_vec();
+                args.push(&patch);
+                if pick == diff::Pick::Discard {
+                    // Applying the same patch forward brings the lines back.
+                    let undo = Undo::Custom {
+                        undo: ops(&[&["apply", &patch]]),
+                        redo: ops(&[&args]),
+                    };
+                    self.run_undoable(&label, ops(&[&args]), Refresh::Status, undo, ctx);
+                } else {
+                    self.run_ops(&label, ops(&[&args]), Refresh::Status, plain, ctx);
+                }
+            }
+            Action::Compare {
+                base,
+                base_label,
+                target,
+                target_label,
+                since_fork,
+            } => self.compare(
+                Compare {
+                    base,
+                    base_label,
+                    target,
+                    target_label,
+                    since_fork,
+                    data: None,
+                    request: 0,
+                },
+                ctx,
+            ),
+            Action::CompareSinceFork(on) => {
+                if let Some(c) = &mut self.compare {
+                    c.since_fork = on;
+                    self.reload_compare(ctx);
+                }
+            }
+            Action::SwapCompare => {
+                // The working tree stays the newer end.
+                if let Some(c) = self.compare.take_if(|c| c.target.is_some())
+                    && let Some(target) = c.target
+                {
+                    self.compare(
+                        Compare {
+                            base: target,
+                            base_label: c.target_label,
+                            target: Some(c.base),
+                            target_label: c.base_label,
+                            data: None,
+                            ..c
+                        },
+                        ctx,
+                    );
+                }
+            }
+            Action::CloseCompare => {
+                self.compare = None;
+                if matches!(
+                    self.diff,
+                    Some(DiffView {
+                        key: DiffKey::Range { .. },
+                        ..
+                    })
+                ) {
+                    self.diff = None;
+                }
+            }
+            Action::SearchCode(on) => {
+                if self.search.code != on {
+                    self.search.code = on;
+                    self.run_search(ctx);
+                }
+                self.search.focus = true;
+            }
             Action::SaveConflict => {
                 if let Some(editor) = &self.conflict {
                     match editor.save(&self.path) {
@@ -1654,6 +1931,8 @@ impl RepoTab {
                 acts.push(Action::CloseRebase);
             } else if esc && self.file_view.is_some() {
                 acts.push(Action::CloseFileView);
+            } else if esc && self.compare.is_some() {
+                acts.push(Action::CloseCompare);
             } else if esc && self.search.open {
                 acts.push(Action::ToggleSearch);
             }
@@ -1994,6 +2273,16 @@ impl RepoTab {
             for b in &self.refs.local {
                 if !b.is_head {
                     items.push((
+                        format!("Changes {} adds to {current}", b.name),
+                        "compare".into(),
+                        compare_action(current, &b.name, true),
+                    ));
+                    items.push((
+                        format!("Compare {current} with {}", b.name),
+                        "compare".into(),
+                        compare_action(current, &b.name, false),
+                    ));
+                    items.push((
                         format!("Merge {} into {current}", b.name),
                         "merge".into(),
                         merge_action(&b.name, current),
@@ -2016,6 +2305,18 @@ impl RepoTab {
             }
         }
         items
+    }
+}
+
+/// Compares branch (or commit) `base` with `target`; `since_fork`: only what `target` changed
+/// since they diverged.
+pub(crate) fn compare_action(base: &str, target: &str, since_fork: bool) -> Action {
+    Action::Compare {
+        base: base.to_owned(),
+        base_label: base.to_owned(),
+        target: Some(target.to_owned()),
+        target_label: target.to_owned(),
+        since_fork,
     }
 }
 
@@ -2080,6 +2381,7 @@ pub(crate) fn open_in_editor(editor: &str, path: &Path) -> Result<(), String> {
     } else {
         let mut c = std::process::Command::new(editor);
         c.arg(path);
+        crate::shell_path::apply(&mut c);
         c
     };
     #[cfg(windows)]
@@ -2120,6 +2422,11 @@ fn headline(msg: &str) -> String {
     } else {
         format!("{label}: {line}")
     }
+}
+
+/// A hash as the UI shows it: its first 8 characters.
+pub(crate) fn short(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
 }
 
 /// `&[&["checkout", "main"]]` → owned argument lists.

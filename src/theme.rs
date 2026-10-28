@@ -336,7 +336,8 @@ pub fn apply(ctx: &egui::Context, kind: ThemeKind) {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 4.0);
         s.spacing.interact_size = egui::vec2(24.0, 24.0);
-        s.spacing.menu_margin = egui::Margin::same(6);
+        // Tooltips and other popups (menus set their own, see `menu_style`).
+        s.spacing.menu_margin = egui::Margin::symmetric(12, 7);
         s.spacing.window_margin = egui::Margin::same(16);
         s.spacing.icon_width = 14.0;
         s.visuals.indent_has_left_vline = false;

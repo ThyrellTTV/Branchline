@@ -33,23 +33,33 @@ fn main() {
     for step in steps {
         let (cmd, arg) = step.split_once(':').unwrap_or((step.as_str(), ""));
         match cmd {
-            "click" | "rclick" => {
+            "click" | "rclick" | "cclick" | "sclick" => {
                 let pos = point(arg);
-                let button = if cmd == "click" {
-                    PointerButton::Primary
-                } else {
+                let button = if cmd == "rclick" {
                     PointerButton::Secondary
+                } else {
+                    PointerButton::Primary
+                };
+                let modifiers = match cmd {
+                    "cclick" => Modifiers::COMMAND,
+                    "sclick" => Modifiers::SHIFT,
+                    _ => Modifiers::NONE,
                 };
                 harness.event(Event::PointerMoved(pos));
+                harness.step();
+                // The modifier held down around the click, as the keyboard reports it.
+                harness.event(Event::ModifiersChanged(modifiers));
                 harness.step();
                 for pressed in [true, false] {
                     harness.event(Event::PointerButton {
                         pos,
                         button,
                         pressed,
-                        modifiers: Modifiers::NONE,
+                        modifiers,
                     });
                 }
+                harness.step();
+                harness.event(Event::ModifiersChanged(Modifiers::NONE));
                 settle(&mut harness, 400);
             }
             "dclick" => {
@@ -73,6 +83,29 @@ fn main() {
             "leave" => {
                 harness.remove_cursor();
                 settle(&mut harness, 200);
+            }
+            // `wheel:x,y,dy`: the mouse wheel over a point; a negative `dy` scrolls down.
+            "wheel" => {
+                let n: Vec<f32> = arg
+                    .split(',')
+                    .map(|v| v.trim().parse().unwrap_or(0.0))
+                    .collect();
+                let (pos, dy) = (
+                    Pos2::new(
+                        n.first().copied().unwrap_or(0.0),
+                        n.get(1).copied().unwrap_or(0.0),
+                    ),
+                    n.get(2).copied().unwrap_or(0.0),
+                );
+                harness.event(Event::PointerMoved(pos));
+                harness.step();
+                harness.event(Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, dy),
+                    modifiers: Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                });
+                settle(&mut harness, 600);
             }
             "drag" => {
                 let n: Vec<f32> = arg

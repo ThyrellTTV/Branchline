@@ -1,6 +1,8 @@
 //! Central pane while a file is open: its diff, unified or side by side, with syntax colours,
-//! the changed part of each line marked, and images shown before / after.
+//! the changed part of each line marked, and images shown before / after. Uncommitted changes
+//! can be staged, unstaged or discarded a hunk or a few lines at a time.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ use egui::{
 
 use super::highlight::{self, Spans};
 use super::widgets;
-use super::{Action, DiffKey, Refresh, RepoTab, ops};
+use super::{Action, DiffKey, Refresh, RepoTab, ops, short};
 use crate::git::{self, Area};
 use crate::icons;
 use crate::theme::{self, Tokens};
@@ -37,7 +39,10 @@ pub struct DiffLine {
     pub kind: Kind,
     pub old: Option<u32>,
     pub new: Option<u32>,
+    /// What is shown: the line without its `+`/`-` column, tabs expanded.
     pub text: String,
+    /// The line exactly as git printed it, to build patches from.
+    pub raw: String,
 }
 
 /// Everything the view needs, prepared on a background thread.
@@ -50,6 +55,45 @@ pub struct DiffData {
     /// Side-by-side rows: (left line, right line).
     pub split: Vec<(Option<usize>, Option<usize>)>,
     pub image: Option<ImagePair>,
+    /// The patch's file header (`diff --git`, `index`, `---`, `+++`), for partial patches.
+    pub header: String,
+    /// Hunks and lines can be staged, unstaged or discarded on their own.
+    pub partial: bool,
+}
+
+/// What to do with some hunks or lines of an uncommitted file's diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// Unstaged lines into the index.
+    Stage,
+    /// Staged lines out of the index.
+    Unstage,
+    /// Unstaged lines out of the working tree.
+    Discard,
+}
+
+impl Pick {
+    /// The patch is applied with `--reverse`.
+    fn reverse(self) -> bool {
+        self != Pick::Stage
+    }
+
+    /// `git apply` arguments before the patch file.
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Pick::Stage => &["apply", "--cached"],
+            Pick::Unstage => &["apply", "--cached", "--reverse"],
+            Pick::Discard => &["apply", "--reverse"],
+        }
+    }
+
+    pub fn verb(self) -> &'static str {
+        match self {
+            Pick::Stage => "Stage",
+            Pick::Unstage => "Unstage",
+            Pick::Discard => "Discard",
+        }
+    }
 }
 
 pub struct ImagePair {
@@ -66,8 +110,30 @@ pub fn load(repo: &Path, key: &DiffKey, ignore_ws: bool, dark: bool) -> Result<D
             (git::file_diff(repo, hash, path, ignore_ws)?, path.clone())
         }
         DiffKey::Work(file) => (git::work_diff(repo, file, ignore_ws)?, file.path.clone()),
+        DiffKey::Range { from, to, path } => (
+            git::range_file_diff(repo, from, to.as_deref(), path, ignore_ws)?,
+            path.clone(),
+        ),
     };
     let lines = parse(&text);
+    let header = patch_header(&text);
+    // A patch made from a `-w` diff wouldn't apply; new, deleted, renamed and binary files, and
+    // truncated diffs, only go whole.
+    let partial = matches!(key, DiffKey::Work(f) if matches!(f.area, Area::Staged | Area::Unstaged))
+        && !ignore_ws
+        && !header.is_empty()
+        && ![
+            "new file mode",
+            "deleted file mode",
+            "rename from",
+            "copy from",
+            "Binary files",
+        ]
+        .iter()
+        .any(|h| header.contains(h))
+        && lines
+            .iter()
+            .all(|l| l.kind != Kind::Meta || l.raw.starts_with('\\'));
     let image = if is_image(&path) {
         Some(load_images(repo, key, &path))
     } else {
@@ -110,6 +176,8 @@ pub fn load(repo: &Path, key: &DiffKey, ignore_ws: bool, dark: bool) -> Result<D
         changed,
         split,
         image,
+        header,
+        partial,
     })
 }
 
@@ -138,6 +206,11 @@ fn load_images(repo: &Path, key: &DiffKey, path: &str) -> ImagePair {
             Area::Untracked => (None, get(None), "untracked".to_owned()),
             Area::Conflicted => (None, get(None), "conflicted".to_owned()),
         },
+        DiffKey::Range { from, to, .. } => (
+            get(Some(from)),
+            get(to.as_deref()),
+            format!("{from}-{}", to.as_deref().unwrap_or("work")),
+        ),
     };
     ImagePair {
         old,
@@ -215,7 +288,8 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
     let mut in_hunk = false;
     // Combined diffs (`@@@`) prefix every line with one column per parent.
     let mut prefix = 1;
-    for line in text.lines() {
+    // Not `lines()`: a `\r` before the newline belongs to the file's line.
+    for line in text.split_terminator('\n') {
         if out.len() >= MAX_LINES {
             out.push(meta("… diff truncated"));
             break;
@@ -229,7 +303,8 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
                 kind: Kind::Hunk,
                 old: None,
                 new: None,
-                text: line.to_owned(),
+                text: line.trim_end_matches('\r').to_owned(),
+                raw: line.to_owned(),
             });
             continue;
         }
@@ -281,7 +356,8 @@ pub fn parse(text: &str) -> Vec<DiffLine> {
             kind,
             old: if combined { None } else { o },
             new: if combined { None } else { n },
-            text: body.replace('\t', "    "),
+            text: body.trim_end_matches('\r').replace('\t', "    "),
+            raw: line.to_owned(),
         });
     }
     out
@@ -292,8 +368,175 @@ fn meta(text: &str) -> DiffLine {
         kind: Kind::Meta,
         old: None,
         new: None,
-        text: text.to_owned(),
+        text: text.trim_end_matches('\r').to_owned(),
+        raw: text.to_owned(),
     }
+}
+
+/// Everything before the first hunk of a one-file patch, each line ending in `\n`.
+fn patch_header(text: &str) -> String {
+    let mut header = String::new();
+    for line in text.split_terminator('\n') {
+        if line.starts_with("@@") {
+            return header;
+        }
+        header.push_str(line);
+        header.push('\n');
+    }
+    // No hunk at all (binary, mode change only): nothing to pick from.
+    String::new()
+}
+
+/// The lines of the hunk whose header is at `h`: up to the next hunk.
+fn hunk_body(lines: &[DiffLine], h: usize) -> std::ops::Range<usize> {
+    let end = lines[h + 1..]
+        .iter()
+        .position(|l| l.kind == Kind::Hunk)
+        .map_or(lines.len(), |n| h + 1 + n);
+    h + 1..end
+}
+
+/// The added and removed lines of the hunk whose header is at `h`.
+pub fn hunk_changes(lines: &[DiffLine], h: usize) -> BTreeSet<usize> {
+    hunk_body(lines, h)
+        .filter(|&i| matches!(lines[i].kind, Kind::Add | Kind::Del))
+        .collect()
+}
+
+/// `@@ -12,5 +14,7 @@ fn x` → (12, 14, " fn x").
+fn hunk_numbers(header: &str) -> Option<(u32, u32, &str)> {
+    let rest = header.strip_prefix("@@ -")?;
+    let (ranges, tail) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let start = |r: &str| r.split(',').next()?.parse::<u32>().ok();
+    Some((start(old)?, start(new)?, tail))
+}
+
+/// One hunk of a partial patch being written.
+#[derive(Default)]
+struct HunkOut {
+    body: String,
+    old_n: i64,
+    new_n: i64,
+    changed: bool,
+}
+
+impl HunkOut {
+    /// Writes line `i` as the patch needs it (or not at all), and the "\ No newline at end of
+    /// file" note right after it if it has one.
+    fn line(&mut self, lines: &[DiffLine], i: usize, picked: bool, reverse: bool) {
+        let line = &lines[i];
+        let as_context = match line.kind {
+            Kind::Context => true,
+            Kind::Add | Kind::Del if picked => false,
+            // Left out: an addition only exists on the new side, a removal on the old one, so
+            // each stays as context on its side and goes from the other.
+            Kind::Add if reverse => true,
+            Kind::Del if !reverse => true,
+            _ => return,
+        };
+        if as_context {
+            self.body.push(' ');
+            self.body.push_str(line.raw.get(1..).unwrap_or_default());
+            self.old_n += 1;
+            self.new_n += 1;
+        } else {
+            self.body.push_str(&line.raw);
+            self.changed = true;
+            if line.kind == Kind::Add {
+                self.new_n += 1;
+            } else {
+                self.old_n += 1;
+            }
+        }
+        self.body.push('\n');
+        if let Some(note) = lines.get(i + 1).filter(|l| l.kind == Kind::Meta) {
+            self.body.push_str(&note.raw);
+            self.body.push('\n');
+        }
+    }
+}
+
+/// A patch of `header` with only the `chosen` added / removed lines (indices into `lines`), for
+/// `git apply` as `pick` runs it. What isn't chosen stays as it is: a removal left out becomes
+/// context where the patch is checked against the old side, an addition left out where it is
+/// checked against the new side (applied in reverse). `None` when no change is chosen.
+pub fn partial_patch(
+    header: &str,
+    lines: &[DiffLine],
+    chosen: &BTreeSet<usize>,
+    pick: Pick,
+) -> Option<String> {
+    let reverse = pick.reverse();
+    let mut patch = header.to_owned();
+    // How far the hunks written so far moved the other side's line numbers.
+    let mut shift: i64 = 0;
+    let mut any = false;
+    for h in (0..lines.len()).filter(|&i| lines[i].kind == Kind::Hunk) {
+        let (old_start, new_start, tail) = hunk_numbers(&lines[h].raw)?;
+        let mut out = HunkOut::default();
+        let body = hunk_body(lines, h);
+        let mut i = body.start;
+        while i < body.end {
+            match lines[i].kind {
+                Kind::Del | Kind::Add => {
+                    // A run of removals and the additions after it, written in pairs (like the
+                    // side-by-side view pairs them): replacing the 2nd line of three keeps its
+                    // place even when the others are left out.
+                    let mut run = |kind: Kind| {
+                        let mut found = Vec::new();
+                        while i < body.end
+                            && matches!(lines[i].kind, k if k == kind || k == Kind::Meta)
+                        {
+                            if lines[i].kind == kind {
+                                found.push(i);
+                            }
+                            i += 1;
+                        }
+                        found
+                    };
+                    let dels = run(Kind::Del);
+                    let adds = run(Kind::Add);
+                    for k in 0..dels.len().max(adds.len()) {
+                        for &j in dels.get(k).into_iter().chain(adds.get(k)) {
+                            out.line(lines, j, chosen.contains(&j), reverse);
+                        }
+                    }
+                }
+                Kind::Context => {
+                    out.line(lines, i, false, reverse);
+                    i += 1;
+                }
+                // Notes go with their line.
+                _ => i += 1,
+            }
+        }
+        let HunkOut {
+            body,
+            old_n,
+            new_n,
+            changed,
+        } = out;
+        if !changed {
+            continue;
+        }
+        any = true;
+        // `git apply` places a hunk by the side it checks: the old one, the new one in reverse.
+        let (old_start, new_start) = (i64::from(old_start), i64::from(new_start));
+        let (o, n) = if reverse {
+            (new_start - shift, new_start)
+        } else {
+            (old_start, old_start + shift)
+        };
+        shift += new_n - old_n;
+        patch.push_str(&format!(
+            "@@ -{},{old_n} +{},{new_n} @@{tail}\n",
+            o.max(0),
+            n.max(0)
+        ));
+        patch.push_str(&body);
+    }
+    any.then_some(patch)
 }
 
 /// `@@ -12,5 +14,7 @@` → (11, 13): the numbers before the first line of the hunk.
@@ -338,8 +581,12 @@ impl RepoTab {
                     Area::Conflicted => "Conflicted".to_owned(),
                 },
             ),
+            DiffKey::Range { from, to, path } => (path.clone(), self.range_label(from, to)),
         };
+        let partial = matches!(&view.data, Some(Ok(d)) if d.partial) && idle;
+        let chosen = view.chosen.len();
         let (split, ignore_ws) = (self.diff_split, self.diff_ignore_ws);
+        let mut clear = false;
         egui::Frame::new()
             .fill(t.chrome)
             .inner_margin(egui::Margin::symmetric(10, 6))
@@ -353,6 +600,8 @@ impl RepoTab {
                     );
                     let (rev, ignorable) = match &view.key {
                         DiffKey::Commit { hash, .. } => (Some(hash.as_str()), false),
+                        DiffKey::Range { to: Some(to), .. } => (Some(to.as_str()), false),
+                        DiffKey::Range { to: None, .. } => (None, false),
                         DiffKey::Work(_) => (None, true),
                     };
                     widgets::file_menu(&title, &path, rev, ignorable, acts);
@@ -377,6 +626,35 @@ impl RepoTab {
                                     ops: ops(&[&args]),
                                     refresh: Refresh::Status,
                                 });
+                            }
+                            // The lines clicked in the diff.
+                            if partial && chosen > 0 {
+                                ui.add_space(8.0);
+                                let lines = if chosen == 1 { "line" } else { "lines" };
+                                let picks: &[Pick] = if file.area == Area::Staged {
+                                    &[Pick::Unstage]
+                                } else {
+                                    &[Pick::Stage, Pick::Discard]
+                                };
+                                for &pick in picks {
+                                    let b = egui::Button::new(format!(
+                                        "{} {chosen} {lines}",
+                                        pick.verb()
+                                    ));
+                                    if ui.add(b).clicked() {
+                                        acts.push(Action::PickLines {
+                                            pick,
+                                            lines: view.chosen.clone(),
+                                        });
+                                    }
+                                }
+                                if ui
+                                    .button("Clear")
+                                    .on_hover_text("Unselect the lines")
+                                    .clicked()
+                                {
+                                    clear = true;
+                                }
                             }
                         }
                         ui.add_space(8.0);
@@ -472,6 +750,42 @@ impl RepoTab {
         } else {
             data.lines.len()
         };
+        // Which hunk actions the headers offer.
+        let hunk_picks: &[Pick] = match &view.key {
+            DiffKey::Work(f) if partial && f.area == Area::Staged => &[Pick::Unstage],
+            DiffKey::Work(_) if partial => &[Pick::Stage, Pick::Discard],
+            _ => &[],
+        };
+        let shift = ui.input(|i| i.modifiers.shift);
+        // A changed line clicked: (line, extend the selection).
+        let mut clicked: Option<usize> = None;
+        let mut paint = |ui: &mut Ui, rect: Rect, i: usize, side: Side| {
+            let kind = data.lines.get(i).map(|l| l.kind);
+            let pickable = partial && matches!(kind, Some(Kind::Add | Kind::Del));
+            paint_line(ui, rect, data, i, side, &font, &t, view.chosen.contains(&i));
+            if pickable {
+                let resp = ui
+                    .interact(rect, ui.id().with(("diff_line", i)), Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if resp.clicked() {
+                    clicked = Some(i);
+                }
+            }
+            if kind == Some(Kind::Hunk) && !hunk_picks.is_empty() {
+                // At the visible right end, however wide the line is.
+                let mut right = rect.right().min(ui.clip_rect().right()) - 6.0;
+                for &pick in hunk_picks.iter().rev() {
+                    let (resp, left) = hunk_button(ui, right, rect.center().y, pick, i);
+                    if resp.clicked() {
+                        acts.push(Action::PickLines {
+                            pick,
+                            lines: hunk_changes(&data.lines, i),
+                        });
+                    }
+                    right = left - 4.0;
+                }
+            }
+        };
         egui::ScrollArea::both()
             .id_salt(("diff_scroll", &path, split))
             .auto_shrink(false)
@@ -498,15 +812,15 @@ impl RepoTab {
                                 Some(Kind::Hunk | Kind::Meta)
                             )
                         {
-                            paint_line(ui, rect, data, i, Side::Both, &font, &t);
+                            paint(ui, rect, i, Side::Both);
                             continue;
                         }
                         match l {
-                            Some(i) => paint_line(ui, left, data, i, Side::Old, &font, &t),
+                            Some(i) => paint(ui, left, i, Side::Old),
                             None => filler(ui, left, &t),
                         }
                         match r {
-                            Some(i) => paint_line(ui, right, data, i, Side::New, &font, &t),
+                            Some(i) => paint(ui, right, i, Side::New),
                             None => filler(ui, right, &t),
                         }
                         ui.painter().line_segment(
@@ -519,11 +833,103 @@ impl RepoTab {
                         (NUM_W * 2.0 + 24.0 + longest * char_w + 24.0).max(ui.available_width());
                     for i in range {
                         let (rect, _) = ui.allocate_exact_size(vec2(width, LINE_H), Sense::hover());
-                        paint_line(ui, rect, data, i, Side::Unified, &font, &t);
+                        paint(ui, rect, i, Side::Unified);
                     }
                 }
             });
+
+        if let Some(view) = &mut self.diff {
+            if clear {
+                view.chosen.clear();
+                view.anchor = None;
+            }
+            if let Some(i) = clicked {
+                view.pick_line(i, shift);
+            }
+        }
     }
+
+    /// "abc1234 → def5678" for a diff between two commits, with the names of the comparison.
+    fn range_label(&self, from: &str, to: &Option<String>) -> String {
+        let name = |rev: &str| {
+            self.compare
+                .as_ref()
+                .and_then(|c| c.name_of(rev))
+                .unwrap_or_else(|| short(rev).to_owned())
+        };
+        match to {
+            Some(to) => format!("{} → {}", name(from), name(to)),
+            None => format!("{} → working tree", name(from)),
+        }
+    }
+}
+
+impl super::DiffView {
+    /// Click on a changed line: toggles it, or with Shift selects every changed line from the
+    /// last one clicked.
+    fn pick_line(&mut self, i: usize, extend: bool) {
+        let Some(Ok(data)) = &self.data else { return };
+        match self.anchor {
+            Some(a) if extend => {
+                let (lo, hi) = (a.min(i), a.max(i));
+                self.chosen.extend(
+                    (lo..=hi).filter(|&k| matches!(data.lines[k].kind, Kind::Add | Kind::Del)),
+                );
+            }
+            _ => {
+                if !self.chosen.remove(&i) {
+                    self.chosen.insert(i);
+                }
+                self.anchor = Some(i);
+            }
+        }
+    }
+}
+
+/// A small text button in a hunk header, its right edge at `right`; returns it and its left edge.
+fn hunk_button(ui: &mut Ui, right: f32, y: f32, pick: Pick, hunk: usize) -> (egui::Response, f32) {
+    let t = Tokens::get(ui.ctx());
+    let label = format!("{} hunk", pick.verb());
+    let color = if pick == Pick::Discard {
+        t.text_dim
+    } else {
+        t.accent
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label, theme::medium(11.0), color);
+    let r = Rect::from_min_max(
+        pos2(right - galley.size().x - 14.0, y - 9.0),
+        pos2(right, y + 9.0),
+    );
+    let resp = ui.interact(
+        r,
+        ui.id().with(("hunk_btn", hunk, pick.verb())),
+        Sense::click(),
+    );
+    let fill = if resp.hovered() { t.hover } else { t.dock };
+    ui.painter().rect_filled(r, t.radius_sm, fill);
+    ui.painter().rect_stroke(
+        r,
+        t.radius_sm,
+        Stroke::new(1.0, t.separator),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        pos2(r.left() + 7.0, y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    let tip = match pick {
+        Pick::Stage => {
+            "Stage this hunk. Click lines to stage only some of them (Shift+click for a range)."
+        }
+        Pick::Unstage => {
+            "Unstage this hunk. Click lines to unstage only some of them (Shift+click for a range)."
+        }
+        Pick::Discard => "Throw away this hunk's changes (Ctrl+Z brings them back).",
+    };
+    (resp.on_hover_text(tip), r.left())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -540,6 +946,7 @@ fn filler(ui: &Ui, rect: Rect, t: &Tokens) {
         .rect_filled(rect, 0.0, t.card.gamma_multiply(0.35));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_line(
     ui: &Ui,
     rect: Rect,
@@ -548,6 +955,7 @@ fn paint_line(
     side: Side,
     font: &egui::FontId,
     t: &Tokens,
+    selected: bool,
 ) {
     let Some(line) = data.lines.get(i) else {
         return;
@@ -562,6 +970,10 @@ fn paint_line(
     };
     if let Some(bg) = bg {
         p.rect_filled(rect, 0.0, bg);
+    }
+    // Picked to stage / unstage / discard: tinted, with a bar on the left.
+    if selected {
+        p.rect_filled(rect, 0.0, t.accent.gamma_multiply(0.22));
     }
     let y = rect.center().y;
     let numbers: &[(Option<u32>, f32)] = match side {
@@ -580,6 +992,13 @@ fn paint_line(
             Rect::from_min_size(rect.min, vec2(gutter, LINE_H)),
             0.0,
             t.card.gamma_multiply(0.6),
+        );
+    }
+    if selected {
+        p.rect_filled(
+            Rect::from_min_size(rect.min, vec2(3.0, LINE_H)),
+            0.0,
+            t.accent,
         );
     }
     for &(n, x) in numbers {
@@ -789,6 +1208,135 @@ mod tests {
     fn rewrites_are_not_marked_inline() {
         assert_eq!(changed_ranges("completely", "different words"), None);
         assert_eq!(changed_ranges("abc", "abXc"), Some(((2, 2), (2, 3))));
+    }
+
+    const PATCH: &str = "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n\
+        @@ -1,4 +1,4 @@ top\n a\n-b\n-c\n+B\n+C\n d\n\
+        @@ -10,2 +10,3 @@\n x\n+y\n z\n";
+
+    /// The hunks of a partial patch, without the file header.
+    fn hunks(lines: &[DiffLine], chosen: &[usize], pick: Pick) -> Option<String> {
+        let header = patch_header(PATCH);
+        let chosen: BTreeSet<usize> = chosen.iter().copied().collect();
+        partial_patch(&header, lines, &chosen, pick)
+            .and_then(|p| p.strip_prefix(&header).map(str::to_owned))
+    }
+
+    #[test]
+    fn partial_patch_keeps_only_the_chosen_lines() {
+        let lines = parse(PATCH);
+        assert_eq!(patch_header(PATCH).lines().count(), 4);
+        // Indices: 0 hunk, 1 a, 2 -b, 3 -c, 4 +B, 5 +C, 6 d, 7 hunk, 8 x, 9 +y, 10 z.
+        // b → B only: c stays where it was, after B.
+        assert_eq!(
+            hunks(&lines, &[2, 4], Pick::Stage).as_deref(),
+            Some("@@ -1,4 +1,4 @@ top\n a\n-b\n+B\n c\n d\n")
+        );
+        // In reverse an addition left out stays as context and a removal left out goes.
+        assert_eq!(
+            hunks(&lines, &[2, 4], Pick::Discard).as_deref(),
+            Some("@@ -1,4 +1,4 @@ top\n a\n-b\n+B\n C\n d\n")
+        );
+        // The second hunk alone, after the first moved nothing.
+        let second: Vec<usize> = hunk_changes(&lines, 7).into_iter().collect();
+        assert_eq!(
+            hunks(&lines, &second, Pick::Stage).as_deref(),
+            Some("@@ -10,2 +10,3 @@\n x\n+y\n z\n")
+        );
+        assert_eq!(hunks(&lines, &[], Pick::Stage), None);
+    }
+
+    #[test]
+    fn later_hunks_follow_the_lines_earlier_ones_add() {
+        let lines = parse(PATCH);
+        // Only the additions of the first hunk (+2 lines), and the second hunk.
+        let patch = hunks(&lines, &[4, 5, 9], Pick::Stage).unwrap_or_default();
+        assert!(patch.starts_with("@@ -1,4 +1,6 @@ top\n a\n b\n+B\n c\n+C\n d\n"));
+        assert!(patch.contains("@@ -10,2 +12,3 @@\n"));
+    }
+
+    #[test]
+    fn no_newline_note_follows_its_line() {
+        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n";
+        let lines = parse(text);
+        let header = patch_header(text);
+        // Only the removal of the last line: its note goes with it, the addition is left out.
+        let chosen: BTreeSet<usize> = [2].into();
+        let patch = partial_patch(&header, &lines, &chosen, Pick::Stage).unwrap_or_default();
+        assert!(patch.ends_with("@@ -1,2 +1,1 @@\n a\n-b\n\\ No newline at end of file\n"));
+    }
+
+    #[test]
+    fn crlf_lines_keep_their_carriage_return() {
+        let lines = parse("@@ -1 +1 @@\n-a\r\n+b\r\n");
+        assert_eq!(lines[1].text, "a");
+        assert_eq!(lines[2].raw, "+b\r");
+    }
+
+    /// Stages, unstages and discards a few lines in a real repository.
+    #[test]
+    fn partial_patches_apply_with_git() {
+        let dir = std::env::temp_dir().join(format!("gitcraft-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let git = |args: &[&str]| git::run(Some(&dir), args);
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "t"],
+            &["config", "user.email", "t@t"],
+            &["config", "core.autocrlf", "false"],
+        ] {
+            assert!(git(args).is_ok());
+        }
+        let file = dir.join("f.txt");
+        let base: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let _ = std::fs::write(&file, &base);
+        assert!(git(&["add", "."]).is_ok());
+        assert!(git(&["commit", "-q", "-m", "base"]).is_ok());
+        let edited = base
+            .replace("line 2\n", "line two\n")
+            .replace("line 3\n", "line three\n")
+            .replace("line 18\n", "line 18\nline 18b\n");
+        let _ = std::fs::write(&file, &edited);
+
+        let work = |area| git::StatusFile {
+            path: "f.txt".to_owned(),
+            old_path: None,
+            code: 'M',
+            area,
+        };
+        let pick = |area, which: &dyn Fn(&DiffLine) -> bool, how: Pick| -> Result<(), String> {
+            let data = load(&dir, &DiffKey::Work(work(area)), false, true)?;
+            assert!(data.partial);
+            let chosen = (0..data.lines.len())
+                .filter(|&i| which(&data.lines[i]))
+                .collect();
+            let patch =
+                partial_patch(&data.header, &data.lines, &chosen, how).ok_or("nothing picked")?;
+            let path = git::save_patch(&patch)?.to_string_lossy().into_owned();
+            let mut args = how.args().to_vec();
+            args.push(&path);
+            git(&args).map(|_| ())
+        };
+        let index = || git(&["show", ":f.txt"]).unwrap_or_default();
+        // Stage line 2 → "line two" only.
+        let second = |l: &DiffLine| l.text == "line 2" || l.text == "line two";
+        assert_eq!(pick(Area::Unstaged, &second, Pick::Stage), Ok(()));
+        assert_eq!(index(), base.replace("line 2\n", "line two\n"));
+        // Discard the line added near the end.
+        let added = |l: &DiffLine| l.text == "line 18b";
+        assert_eq!(pick(Area::Unstaged, &added, Pick::Discard), Ok(()));
+        let on_disk = std::fs::read_to_string(&file).unwrap_or_default();
+        assert_eq!(
+            on_disk,
+            base.replace("line 2\n", "line two\n")
+                .replace("line 3\n", "line three\n")
+        );
+        // Unstage the addition but keep the removal staged.
+        let two = |l: &DiffLine| l.text == "line two";
+        assert_eq!(pick(Area::Staged, &two, Pick::Unstage), Ok(()));
+        assert_eq!(index(), base.replace("line 2\n", ""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

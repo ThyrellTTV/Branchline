@@ -5,14 +5,16 @@ use egui::{Align2, Key, RichText, Sense, Ui, pos2, vec2};
 use super::diff::unstage_args;
 use super::widgets::{self, RowExtra};
 use super::{Action, Dialog, DiffKey, DiffView, Refresh, RepoTab, abort_action, ops};
-use crate::git::{Area, StatusFile};
+use crate::git::{Area, ChangedFile, StatusFile};
 use crate::icons;
 use crate::theme::{self, Tokens};
 
 impl RepoTab {
     pub(super) fn detail_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
         let wip = self.selected.is_some_and(|r| self.is_wip(r));
-        if wip {
+        if self.compare.is_some() {
+            self.compare_panel(ui, acts);
+        } else if wip {
             self.changes_panel(ui, acts);
         } else {
             self.commit_panel(ui, acts);
@@ -178,70 +180,164 @@ impl RepoTab {
                             });
                     });
 
-                let (adds, dels) = detail.files.iter().fold((0, 0), |(a, d), f| {
-                    (a + f.added.unwrap_or(0), d + f.removed.unwrap_or(0))
-                });
-                let (rect, _) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(rect, 0.0, t.tab_strip);
-                let y = rect.center().y;
-                let r = p.text(
-                    pos2(rect.left() + 14.0, y),
-                    Align2::LEFT_CENTER,
-                    format!(
-                        "{} file{} changed",
-                        detail.files.len(),
-                        if detail.files.len() == 1 { "" } else { "s" }
-                    ),
-                    theme::semibold(11.5),
-                    t.text_dim,
-                );
-                let r = p.text(
-                    pos2(r.right() + 10.0, y),
-                    Align2::LEFT_CENTER,
-                    format!("+{adds}"),
-                    theme::mono(11.0),
-                    t.success,
-                );
-                p.text(
-                    pos2(r.right() + 6.0, y),
-                    Align2::LEFT_CENTER,
-                    format!("−{dels}"),
-                    theme::mono(11.0),
-                    t.danger,
-                );
-                if detail.parents.len() > 1 {
-                    p.text(
-                        pos2(rect.right() - 10.0, y),
-                        Align2::RIGHT_CENTER,
-                        "vs. first parent",
-                        egui::FontId::proportional(11.0),
-                        t.text_faint,
-                    );
-                }
-
+                let note = (detail.parents.len() > 1).then_some("vs. first parent");
+                files_header(ui, &detail.files, note);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for f in &detail.files {
-                    let key = DiffKey::Commit {
+                self.file_list(ui, acts, &detail.files, Some(&detail.hash), |path| {
+                    DiffKey::Commit {
                         hash: detail.hash.clone(),
-                        path: f.path.clone(),
-                    };
-                    let selected = self.open_key() == Some(&key);
-                    let r = widgets::file_row(
-                        ui,
-                        f.status,
-                        &f.path,
-                        f.old_path.as_deref(),
-                        selected,
-                        RowExtra::Stats(f.added, f.removed),
-                    );
-                    widgets::file_menu(&r.row, &f.path, Some(&detail.hash), false, acts);
-                    if r.row.clicked() {
-                        acts.push(Action::OpenDiff(key));
+                        path: path.to_owned(),
                     }
+                });
+            });
+    }
+
+    /// Changed files, each opening its diff (`key`) when clicked; `rev`: where the files are,
+    /// for their menu (`None`: the working tree).
+    fn file_list(
+        &self,
+        ui: &mut Ui,
+        acts: &mut Vec<Action>,
+        files: &[ChangedFile],
+        rev: Option<&str>,
+        key: impl Fn(&str) -> DiffKey,
+    ) {
+        for f in files {
+            let key = key(&f.path);
+            let selected = self.open_key() == Some(&key);
+            let r = widgets::file_row(
+                ui,
+                f.status,
+                &f.path,
+                f.old_path.as_deref(),
+                selected,
+                RowExtra::Stats(f.added, f.removed),
+            );
+            widgets::file_menu(&r.row, &f.path, rev, false, acts);
+            if r.row.clicked() {
+                acts.push(Action::OpenDiff(key));
+            }
+        }
+    }
+
+    /// Right pane while comparing: the two ends, how far apart they are, and the files that
+    /// differ.
+    fn compare_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
+        let t = Tokens::get(ui.ctx());
+        let Some(c) = &self.compare else { return };
+        widgets::panel_header(ui, "Compare", |ui| {
+            if icons::small_button(ui, "x", "Close (Esc)").clicked() {
+                acts.push(Action::CloseCompare);
+            }
+        });
+        let data = c.data.as_ref().and_then(|d| d.as_ref().ok());
+        let target_name = if c.target.is_some() {
+            c.target_label.as_str()
+        } else {
+            "the working tree"
+        };
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 6.0;
+                egui::Grid::new("compare_ends")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        // A name, and the commit it stands for (`note` before the hash).
+                        let end = |ui: &mut Ui, label: &str, hash: Option<&str>, note: &str| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(label).font(theme::medium(12.5)));
+                                // The hash, unless the label already is it.
+                                if let Some(hash) = hash.filter(|h| super::short(h) != label) {
+                                    ui.label(
+                                        RichText::new(format!("{note}{}", super::short(hash)))
+                                            .font(theme::mono(11.5))
+                                            .color(t.text_faint),
+                                    )
+                                    .on_hover_text(hash);
+                                }
+                            });
+                        };
+                        let note = if c.since_fork { "merge base " } else { "" };
+                        ui.label(RichText::new("From").color(t.text_faint));
+                        end(ui, &c.base_label, data.map(|d| d.from.as_str()), note);
+                        ui.end_row();
+                        ui.label(RichText::new("To").color(t.text_faint));
+                        end(ui, target_name, data.and_then(|d| d.to.as_deref()), "");
+                        ui.end_row();
+                    });
+                if let Some(d) = data {
+                    let (behind, ahead) = d.apart;
+                    let commits = |n: u32| format!("{n} commit{}", if n == 1 { "" } else { "s" });
+                    let other = if c.target.is_some() {
+                        target_name
+                    } else {
+                        "HEAD"
+                    };
+                    let text = match (ahead, behind) {
+                        (0, 0) => "Same history".to_owned(),
+                        (a, 0) => format!("{other} is {} ahead", commits(a)),
+                        (0, b) => format!("{other} is {} behind", commits(b)),
+                        (a, b) => format!("{other} is {} ahead, {b} behind", commits(a)),
+                    };
+                    ui.label(RichText::new(text).color(t.text_dim).small());
+                }
+                ui.horizontal(|ui| {
+                    let mut since = c.since_fork;
+                    let label = format!("Only what {target_name} changed since they diverged");
+                    if ui
+                        .checkbox(&mut since, label)
+                        .on_hover_text(
+                            "Diff from the merge base, as a pull request shows it, instead of \
+                             every difference between the two",
+                        )
+                        .changed()
+                    {
+                        acts.push(Action::CompareSinceFork(since));
+                    }
+                });
+                if c.target.is_some() && ui.button("Swap").clicked() {
+                    acts.push(Action::SwapCompare);
                 }
             });
+
+        match &c.data {
+            None => {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| ui.spinner());
+            }
+            Some(Err(e)) => {
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.colored_label(t.danger, e);
+                });
+            }
+            Some(Ok(d)) => {
+                files_header(ui, &d.files, None);
+                if d.files.is_empty() {
+                    ui.add_space(10.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("No differences").color(t.text_dim));
+                    });
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("compare_scroll")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        self.file_list(ui, acts, &d.files, d.to.as_deref(), |path| {
+                            DiffKey::Range {
+                                from: d.from.clone(),
+                                to: d.to.clone(),
+                                path: path.to_owned(),
+                            }
+                        });
+                    });
+            }
+        }
     }
 
     fn changes_panel(&mut self, ui: &mut Ui, acts: &mut Vec<Action>) {
@@ -572,6 +668,52 @@ fn discard_dialog(f: &StatusFile) -> Dialog {
             None,
         )
         .refresh(Refresh::Status)
+    }
+}
+
+/// "N files changed +a −d", and an optional note on the right.
+fn files_header(ui: &mut Ui, files: &[ChangedFile], note: Option<&str>) {
+    let t = Tokens::get(ui.ctx());
+    let (adds, dels) = files.iter().fold((0, 0), |(a, d), f| {
+        (a + f.added.unwrap_or(0), d + f.removed.unwrap_or(0))
+    });
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 0.0, t.tab_strip);
+    let y = rect.center().y;
+    let r = p.text(
+        pos2(rect.left() + 14.0, y),
+        Align2::LEFT_CENTER,
+        format!(
+            "{} file{} changed",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ),
+        theme::semibold(11.5),
+        t.text_dim,
+    );
+    let r = p.text(
+        pos2(r.right() + 10.0, y),
+        Align2::LEFT_CENTER,
+        format!("+{adds}"),
+        theme::mono(11.0),
+        t.success,
+    );
+    p.text(
+        pos2(r.right() + 6.0, y),
+        Align2::LEFT_CENTER,
+        format!("−{dels}"),
+        theme::mono(11.0),
+        t.danger,
+    );
+    if let Some(note) = note {
+        p.text(
+            pos2(rect.right() - 10.0, y),
+            Align2::RIGHT_CENTER,
+            note,
+            egui::FontId::proportional(11.0),
+            t.text_faint,
+        );
     }
 }
 

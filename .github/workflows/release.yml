@@ -1,4 +1,4 @@
-# Builds gitcraft for Windows and Linux and publishes a GitHub release when a `v*` tag is pushed.
+# Builds gitcraft for Windows, Linux and macOS and publishes a GitHub release when a `v*` tag is pushed.
 # Run it by hand (Actions › Release › Run workflow) to only build and download the artifacts.
 name: Release
 
@@ -21,6 +21,9 @@ jobs:
           # The oldest supported runner, so the binary runs on older glibc too.
           - os: ubuntu-22.04
             name: linux-x86_64
+          # Builds for Apple silicon and Intel, joined into one universal app.
+          - os: macos-latest
+            name: macos-universal
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +41,33 @@ jobs:
         run: cargo test --locked
 
       - name: Build
+        if: runner.os != 'macOS'
         run: cargo build --release --locked
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: App, dmg and zip (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          name="gitcraft-${{ github.ref_name }}-${{ matrix.name }}"
+          version="$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)"
+          sh packaging/macos/build-app.sh "$version" "$name"
+          # Both architectures, signed, and the disk image is sound.
+          mkdir check
+          ditto -x -k "$name.zip" check
+          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft
+          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft | grep -q x86_64
+          lipo -archs check/gitcraft.app/Contents/MacOS/gitcraft | grep -q arm64
+          codesign --verify --strict check/gitcraft.app
+          plutil -lint check/gitcraft.app/Contents/Info.plist
+          hdiutil verify "$name.dmg"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -106,6 +135,7 @@ jobs:
           name: gitcraft-${{ matrix.name }}
           path: |
             gitcraft-*.zip
+            gitcraft-*.dmg
             gitcraft-*.tar.gz
             gitcraft-*-setup.exe
             gitcraft-*.AppImage

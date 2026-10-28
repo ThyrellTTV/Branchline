@@ -8,8 +8,8 @@ use egui::{
 
 use super::widgets;
 use super::{
-    Action, Dialog, Refresh, RepoTab, Undo, WIP_HASH, fast_forward_action, merge_action, ops,
-    rebase_action,
+    Action, Dialog, Refresh, RepoTab, Undo, WIP_HASH, compare_action, fast_forward_action,
+    merge_action, ops, rebase_action,
 };
 use crate::git::{self, Refs};
 use crate::icons;
@@ -175,7 +175,12 @@ impl RepoTab {
                 }
                 let resp = self.commit_row(ui, i, cols, lanes, now, acts);
                 if resp.clicked() {
-                    acts.push(Action::Select(i));
+                    // Ctrl+click: compare the selected commit with this one.
+                    let compare = ui
+                        .input(|inp| inp.modifiers.command)
+                        .then(|| self.compare_rows(self.selected?, i))
+                        .flatten();
+                    acts.push(compare.unwrap_or(Action::Select(i)));
                 }
                 let Some(commit) = self.commits.get(i) else {
                     continue;
@@ -207,6 +212,39 @@ impl RepoTab {
             }
         });
         ui.data_mut(|d| d.insert_temp(offset_id, out.state.offset.y));
+    }
+
+    /// Compares two rows of the graph, the older one first; the changes row stands for the
+    /// working tree. `None` for the same row twice.
+    fn compare_rows(&self, a: usize, b: usize) -> Option<Action> {
+        if a == b {
+            return None;
+        }
+        // Rows go newest first.
+        let (old, new) = (a.max(b), a.min(b));
+        let end = |row: usize| {
+            let c = self.commits.get(row)?;
+            let label = badges(&c.refs, &self.refs)
+                .into_iter()
+                .find(|b| b.kind != BadgeKind::DetachedHead)
+                .map(|b| b.label)
+                .unwrap_or_else(|| super::short(&c.hash).to_owned());
+            Some((c.hash.clone(), label))
+        };
+        let (base, base_label) = end(old)?;
+        let (target, target_label) = if self.is_wip(new) {
+            (None, "working tree".to_owned())
+        } else {
+            let (hash, label) = end(new)?;
+            (Some(hash), label)
+        };
+        Some(Action::Compare {
+            base,
+            base_label,
+            target,
+            target_label,
+            since_fork: false,
+        })
     }
 
     /// Right-click menu of a commit row.
@@ -298,6 +336,8 @@ impl RepoTab {
                             label: branch.clone(),
                         });
                     }
+                    ui.separator();
+                    compare_items(ui, acts, branch, current);
                 }
                 ui.separator();
             }
@@ -323,6 +363,40 @@ impl RepoTab {
                 .clicked()
             {
                 acts.push(Action::Checkout(hash.clone()));
+            }
+            ui.separator();
+            if let Some(compare) = self
+                .selected
+                .filter(|&s| s != i)
+                .and_then(|s| self.compare_rows(s, i))
+            {
+                let other = self
+                    .selected
+                    .and_then(|s| self.commits.get(s))
+                    .map(|c| {
+                        if c.hash == WIP_HASH {
+                            "the working tree".to_owned()
+                        } else {
+                            super::short(&c.hash).to_owned()
+                        }
+                    })
+                    .unwrap_or_default();
+                if ui
+                    .button(format!("Compare with {other}"))
+                    .on_hover_text("Also Ctrl+click on a commit")
+                    .clicked()
+                {
+                    acts.push(compare);
+                }
+            }
+            if ui.button("Compare with the working tree").clicked() {
+                acts.push(Action::Compare {
+                    base: hash.clone(),
+                    base_label: short.clone(),
+                    target: None,
+                    target_label: "working tree".to_owned(),
+                    since_fork: false,
+                });
             }
             ui.separator();
             if ui
@@ -493,12 +567,39 @@ impl RepoTab {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     icons::inline(ui, "search", 15.0, t.text_faint);
+                    let code = self.search.code;
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.search.query)
-                            .hint_text("Search messages, authors and hashes in all history")
-                            .desired_width(ui.available_width() - 190.0)
+                            .hint_text(if code {
+                                "Search code added or removed by a commit, in all history"
+                            } else {
+                                "Search messages, authors and hashes in all history"
+                            })
+                            .desired_width(ui.available_width() - 290.0)
                             .margin(egui::Margin::symmetric(8, 4)),
                     );
+                    // Where to look: commit messages or the code they changed.
+                    for (label, on, tip) in [
+                        (
+                            "Messages",
+                            false,
+                            "Search commit messages, authors and hashes",
+                        ),
+                        (
+                            "Code",
+                            true,
+                            "Search the commits that added or removed this text in a file \
+                             (git log -S)",
+                        ),
+                    ] {
+                        if ui
+                            .selectable_label(code == on, label)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            acts.push(Action::SearchCode(on));
+                        }
+                    }
                     if std::mem::take(&mut self.search.focus) {
                         edit.request_focus();
                     }
@@ -577,6 +678,24 @@ impl RepoTab {
                 Rect::from_min_size(rect.min, vec2(3.0, ROW_H)),
                 0.0,
                 t.warning,
+            );
+        }
+        // An end of the comparison shown on the right (the changes row for the working tree).
+        let compared = self
+            .compare
+            .as_ref()
+            .and_then(|c| c.data.as_ref()?.as_ref().ok())
+            .is_some_and(|d| {
+                d.from == commit.hash
+                    || d.to.as_deref() == Some(commit.hash.as_str())
+                    || (is_wip && d.to.is_none())
+            });
+        if compared {
+            painter.rect_stroke(
+                rect.shrink(1.0),
+                0.0,
+                Stroke::new(1.0, t.accent),
+                egui::StrokeKind::Inside,
             );
         }
 
@@ -770,18 +889,32 @@ impl RepoTab {
         } else {
             FontId::proportional(12.5)
         };
-        painter
-            .with_clip_rect(Rect::from_min_max(
-                pos2(x, rect.top()),
-                pos2(text_right, rect.bottom()),
-            ))
-            .text(
-                pos2(x + 2.0, mid),
-                Align2::LEFT_CENTER,
-                &commit.summary,
-                font,
+        // The summary, then the rest of the message faded, cut with an ellipsis.
+        let text_clip = painter.with_clip_rect(Rect::from_min_max(
+            pos2(x, rect.top()),
+            pos2(text_right, rect.bottom()),
+        ));
+        let summary = text_clip.text(
+            pos2(x + 2.0, mid),
+            Align2::LEFT_CENTER,
+            &commit.summary,
+            font.clone(),
+            t.text,
+        );
+        let room = text_right - summary.right() - 12.0;
+        if !commit.body.is_empty() && room > 24.0 {
+            let mut job = egui::text::LayoutJob::single_section(
+                commit.body.clone(),
+                egui::TextFormat::simple(FontId::proportional(12.5), t.text.gamma_multiply(0.5)),
+            );
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            text_clip.galley(
+                pos2(summary.right() + 10.0, mid - galley.size().y / 2.0),
+                galley,
                 t.text,
             );
+        }
 
         let small = FontId::proportional(11.5);
         if cols.hash > 0.0 {
@@ -816,6 +949,25 @@ impl RepoTab {
             );
         }
         resp
+    }
+}
+
+/// Menu entries comparing `branch` with `current`: what it would bring in (since they
+/// diverged, as a pull request shows it), and every difference.
+pub(super) fn compare_items(ui: &mut Ui, acts: &mut Vec<Action>, branch: &str, current: &str) {
+    if ui
+        .button(format!("Changes {branch} adds to {current}"))
+        .on_hover_text("What it changed since the two diverged, as a pull request shows it")
+        .clicked()
+    {
+        acts.push(compare_action(current, branch, true));
+    }
+    if ui
+        .button(format!("Compare {current} with {branch}"))
+        .on_hover_text("Every difference between the two")
+        .clicked()
+    {
+        acts.push(compare_action(current, branch, false));
     }
 }
 

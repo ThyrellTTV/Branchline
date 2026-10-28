@@ -21,6 +21,7 @@ const SOURCES: &[(&str, &str)] = icons![
     "arrow-down-to-line",
     "arrow-up",
     "arrow-up-from-line",
+    "book-open",
     "check",
     "chevron-down",
     "chevron-right",
@@ -193,6 +194,18 @@ pub fn small_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
         t.icon
     };
     paint(ui, rect, icon, 14.0, tint);
+    resp.on_hover_text(tooltip)
+}
+
+/// An icon-only button of the window's title bar, a size up from [`small_button`].
+pub fn bar_button(ui: &mut Ui, icon: &str, tooltip: &str) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, t.radius, t.pressed);
+    }
+    let tint = if resp.hovered() { t.text } else { t.icon };
+    paint(ui, rect, icon, 17.0, tint);
     resp.on_hover_text(tooltip)
 }
 

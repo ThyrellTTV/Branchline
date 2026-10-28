@@ -79,6 +79,7 @@ pub struct App {
     skipped_version: String,
     settings: Settings,
     settings_open: bool,
+    manual_open: bool,
     palette: Option<Palette>,
     toasts: Vec<Toast>,
 }
@@ -103,6 +104,7 @@ enum AppCommand {
     Create,
     Clone,
     Settings,
+    Manual,
     Theme(ThemeKind),
 }
 
@@ -135,6 +137,7 @@ impl App {
             clone_parent: saved.clone_parent,
             settings: saved.settings.clone(),
             settings_open: false,
+            manual_open: false,
             palette: None,
             toasts: Vec::new(),
             error: None,
@@ -395,8 +398,9 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(6.0);
-                if icons::small_button(ui, "settings", "Settings").clicked() {
+                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if icons::bar_button(ui, "settings", "Settings").clicked() {
                     self.settings_open = true;
                 }
                 if let Some(release) = self.update.clone() {
@@ -429,10 +433,10 @@ impl App {
                             }
                         });
                 }
-                if icons::small_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
+                if icons::bar_button(ui, "command", "Command palette (Ctrl+P)").clicked() {
                     self.open_palette();
                 }
-                let resp = icons::small_button(ui, "palette", "Theme");
+                let resp = icons::bar_button(ui, "palette", "Theme");
                 egui::Popup::menu(&resp)
                     .style(crate::theme::menu_style)
                     .show(|ui| {
@@ -447,6 +451,11 @@ impl App {
                             }
                         }
                     });
+                if icons::bar_button(ui, "book-open", "Manual and keyboard shortcuts (F1)")
+                    .clicked()
+                {
+                    self.manual_open = true;
+                }
             });
         });
         if let Some(i) = select {
@@ -815,16 +824,21 @@ impl eframe::App for App {
         let modal_open = self.clone_form.is_some()
             || self.palette.is_some()
             || self.settings_open
+            || self.manual_open
             || ctx.egui_wants_keyboard_input();
-        let (new_tab, close, refresh, focused, palette) = ctx.input(|i| {
+        let (new_tab, close, refresh, focused, palette, manual) = ctx.input(|i| {
             (
                 i.modifiers.command && i.key_pressed(Key::T),
                 i.modifiers.command && i.key_pressed(Key::W),
                 i.key_pressed(Key::F5),
                 i.focused,
                 i.modifiers.command && i.key_pressed(Key::P),
+                i.key_pressed(Key::F1),
             )
         });
+        if manual && self.clone_form.is_none() && !self.settings_open && self.palette.is_none() {
+            self.manual_open = !self.manual_open;
+        }
         if palette && self.clone_form.is_none() && !self.settings_open {
             if self.palette.is_some() {
                 self.palette = None;
@@ -872,8 +886,10 @@ impl eframe::App for App {
         let active = self.active;
         match self.tabs.get_mut(active) {
             Some(Tab::Repo(repo)) => {
-                repo.keys_blocked =
-                    self.palette.is_some() || self.settings_open || self.clone_form.is_some();
+                repo.keys_blocked = self.palette.is_some()
+                    || self.settings_open
+                    || self.manual_open
+                    || self.clone_form.is_some();
                 repo.ui(ui);
                 // A worktree asked to be opened in its own tab.
                 if let Some(path) = repo.open_request.take() {
@@ -889,6 +905,7 @@ impl eframe::App for App {
         self.clone_dialog(&ctx);
         self.palette_ui(&ctx);
         self.settings_ui(&ctx);
+        self.manual_ui(&ctx);
 
         // Long operations that ended: a toast, and a desktop notification when away.
         for tab in &mut self.tabs {
@@ -1107,6 +1124,11 @@ impl App {
                 "app".to_owned(),
                 Entry::App(AppCommand::Settings),
             ),
+            (
+                "Manual and keyboard shortcuts".to_owned(),
+                "F1".to_owned(),
+                Entry::App(AppCommand::Manual),
+            ),
         ];
         for kind in ThemeKind::ALL {
             list.push((
@@ -1130,6 +1152,7 @@ impl App {
             Entry::App(AppCommand::Create) => self.pick_new(ctx),
             Entry::App(AppCommand::Clone) => self.start_clone(),
             Entry::App(AppCommand::Settings) => self.settings_open = true,
+            Entry::App(AppCommand::Manual) => self.manual_open = true,
             Entry::App(AppCommand::Theme(kind)) => self.set_theme(ctx, kind),
             Entry::Repo(i) => {
                 if let Some(Tab::Repo(repo)) = self.tabs.get_mut(self.active)
@@ -1295,6 +1318,45 @@ impl App {
             });
         if close || resp.should_close() {
             self.settings_open = false;
+        }
+    }
+
+    fn manual_ui(&mut self, ctx: &egui::Context) {
+        if !self.manual_open {
+            return;
+        }
+        let t = Tokens::get(ctx);
+        let frame = egui::Frame::new()
+            .fill(t.card)
+            .stroke(Stroke::new(1.0, t.field_border))
+            .corner_radius(t.radius_lg)
+            .inner_margin(egui::Margin::same(18))
+            .shadow(ctx.global_style().visuals.window_shadow);
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::new("manual"))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(110))
+            .show(ctx, |ui| {
+                ui.set_width(640.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Manual").font(theme::semibold(16.0)));
+                    ui.label(
+                        RichText::new(format!("gitcraft {}", update::CURRENT)).color(t.text_faint),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::small_button(ui, "x", "Close (Esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                let max = (ctx.content_rect().height() - 140.0).max(240.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max)
+                    .min_scrolled_height(max)
+                    .show(ui, crate::manual::ui);
+            });
+        if close || resp.should_close() {
+            self.manual_open = false;
         }
     }
 

@@ -5,7 +5,8 @@ use egui::{Align2, Rect, Response, Sense, Ui, pos2, vec2};
 
 use super::widgets::{self, ROW_H};
 use super::{
-    Action, Dialog, Refresh, RepoTab, Undo, fast_forward_action, merge_action, ops, rebase_action,
+    Action, Dialog, Refresh, RepoTab, Undo, compare_action, fast_forward_action, merge_action, ops,
+    rebase_action,
 };
 use crate::git::{self, Branch};
 use crate::icons;
@@ -271,6 +272,22 @@ impl RepoTab {
                     label: b.name.clone(),
                 });
             }
+            ui.separator();
+            super::graph_view::compare_items(ui, acts, &b.name, current);
+        }
+        // The checked-out branch against the one pull requests usually go to.
+        if b.is_head
+            && let Some(base) = self.base_ref()
+            && base != b.name
+        {
+            ui.separator();
+            if ui
+                .button(format!("Changes {} adds to {base}", b.name))
+                .on_hover_text("What it changed since the two diverged, as a pull request shows it")
+                .clicked()
+            {
+                acts.push(compare_action(&base, &b.name, true));
+            }
         }
         ui.separator();
         if let Some(remote) = self.default_remote()
@@ -360,6 +377,21 @@ impl RepoTab {
     }
 
     /// The branch pull requests go into by default: the remote's HEAD, else main / master.
+    /// The branch to compare the current one with: the local default base, or its remote one.
+    fn base_ref(&self) -> Option<String> {
+        let base = self.default_base();
+        if self.refs.local.iter().any(|b| b.name == base) {
+            return Some(base);
+        }
+        let remote = format!("{}/{base}", self.default_remote()?);
+        self.refs
+            .remotes
+            .iter()
+            .flat_map(|(_, list)| list)
+            .any(|b| b.name == remote)
+            .then_some(remote)
+    }
+
     fn default_base(&self) -> String {
         let remote = self.default_remote().unwrap_or_else(|| "origin".to_owned());
         let names: Vec<&str> = self
@@ -532,6 +564,9 @@ impl RepoTab {
                             {
                                 acts.push(rebase_action(&b.name, current));
                             }
+                            ui.separator();
+                            super::graph_view::compare_items(ui, acts, &b.name, current);
+                            ui.separator();
                         }
                         if ui.button("Create branch here…").clicked() {
                             acts.push(Action::Dialog(Dialog::create_branch(&b.target, &b.name)));

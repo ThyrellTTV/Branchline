@@ -20,6 +20,7 @@ fn git_cmd() -> Command {
     cmd.env("GIT_EDITOR", "true");
     // Interactive rebases set `sequence.editor` themselves; an inherited one would win.
     cmd.env_remove("GIT_SEQUENCE_EDITOR");
+    crate::shell_path::apply(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -265,6 +266,8 @@ pub struct Commit {
     pub time: i64,
     pub date: String,
     pub summary: String,
+    /// The rest of the message on one line (paragraphs joined by spaces), possibly empty.
+    pub body: String,
     /// Decorations (`HEAD -> main`, `origin/main`, `tag: v1`), as git prints them.
     pub refs: Vec<String>,
 }
@@ -272,7 +275,7 @@ pub struct Commit {
 /// The commits of every branch (stashes aside), newest first, in an order fit for drawing the
 /// graph: `limit` of them after the first `skip`.
 pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String> {
-    let format = format!("--format=%H{FS}%P{FS}%an{FS}%ae{FS}%at{FS}%ad{FS}%s{FS}%D{RS}");
+    let format = format!("--format=%H{FS}%P{FS}%an{FS}%ae{FS}%at{FS}%ad{FS}%s{FS}%D{FS}%b{RS}");
     let limit = format!("--max-count={limit}");
     let skip = format!("--skip={skip}");
     let out = match run(
@@ -300,7 +303,18 @@ pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String
             continue;
         }
         let f: Vec<&str> = record.split(FS).collect();
-        let [hash, parents, author, email, time, date, summary, decor] = f[..] else {
+        let [
+            hash,
+            parents,
+            author,
+            email,
+            time,
+            date,
+            summary,
+            decor,
+            body,
+        ] = f[..]
+        else {
             continue;
         };
         commits.push(Commit {
@@ -311,6 +325,7 @@ pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String
             time: time.parse().unwrap_or(0),
             date: date.to_owned(),
             summary: summary.to_owned(),
+            body: one_line(body),
             refs: decor
                 .split(", ")
                 .filter(|s| !s.is_empty())
@@ -319,6 +334,18 @@ pub fn log(repo: &Path, skip: usize, limit: usize) -> Result<Vec<Commit>, String
         });
     }
     Ok(commits)
+}
+
+/// A commit body as one line: whitespace runs (line breaks included) become single spaces. Long
+/// bodies are cut, the graph only shows their start.
+fn one_line(body: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_CHARS)
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +488,95 @@ pub fn file_diff(repo: &Path, hash: &str, path: &str, ignore_ws: bool) -> Result
     }
     args.extend([hash, "--", path]);
     run(Some(repo), &args)
+}
+
+/// The files that differ from `from` to `to` (a commit, or the working tree when `None`), with
+/// their line counts.
+pub fn diff_files(repo: &Path, from: &str, to: Option<&str>) -> Result<Vec<ChangedFile>, String> {
+    let args = |kind: &'static str| {
+        let mut args = vec!["diff", "-M", kind, "-z", from];
+        args.extend(to);
+        args.push("--");
+        args
+    };
+    let mut files = parse_name_status(&run(Some(repo), &args("--name-status"))?);
+    for (path, added, removed) in parse_numstat(&run(Some(repo), &args("--numstat"))?) {
+        if let Some(file) = files.iter_mut().find(|f| f.path == path) {
+            file.added = added;
+            file.removed = removed;
+        }
+    }
+    Ok(files)
+}
+
+/// The patch of one file from `from` to `to` (the working tree when `None`).
+pub fn range_file_diff(
+    repo: &Path,
+    from: &str,
+    to: Option<&str>,
+    path: &str,
+    ignore_ws: bool,
+) -> Result<String, String> {
+    let mut args = vec!["diff", "-M"];
+    if ignore_ws {
+        args.push("-w");
+    }
+    args.push(from);
+    args.extend(to);
+    args.extend(["--", path]);
+    run(Some(repo), &args)
+}
+
+/// The best common ancestor of two commits.
+pub fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, String> {
+    run(Some(repo), &["merge-base", a, b]).map(|s| s.trim().to_owned())
+}
+
+/// The full hash of a branch, tag or abbreviated hash.
+pub fn resolve(repo: &Path, rev: &str) -> Result<String, String> {
+    run(
+        Some(repo),
+        &["rev-parse", "--verify", "-q", &format!("{rev}^{{commit}}")],
+    )
+    .map(|s| s.trim().to_owned())
+    .map_err(|_| format!("{rev} is not a commit"))
+}
+
+/// How many commits `a` has that `b` hasn't, and the other way round.
+pub fn count_apart(repo: &Path, a: &str, b: &str) -> Result<(u32, u32), String> {
+    let out = run(
+        Some(repo),
+        &["rev-list", "--left-right", "--count", &format!("{a}...{b}")],
+    )?;
+    let mut n = out.split_whitespace().map(|x| x.parse().unwrap_or(0));
+    Ok((n.next().unwrap_or(0), n.next().unwrap_or(0)))
+}
+
+/// Saves `patch` to a temporary file for `git apply`, which reads it from there (so the
+/// operation is a plain list of git commands, which undo can replay). Patches older than a day
+/// are cleared on the way.
+pub fn save_patch(patch: &str) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join("gitcraft-patches");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() > 24 * 3600);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}-{}-{n}.patch", std::process::id(), now()));
+    std::fs::write(&path, patch).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Which side of the index a working-tree file is listed on.
@@ -830,6 +946,23 @@ pub fn search(repo: &Path, query: &str) -> Result<Vec<String>, String> {
     Ok(hashes)
 }
 
+/// Commits that added or removed `query` in a file's contents (`git log -S`), newest first.
+pub fn search_code(repo: &Path, query: &str) -> Result<Vec<String>, String> {
+    let pickaxe = format!("-S{query}");
+    let out = run(
+        Some(repo),
+        &[
+            "log",
+            "--exclude=refs/stash",
+            "--all",
+            "--date-order",
+            "--format=%H",
+            &pickaxe,
+        ],
+    )?;
+    Ok(out.lines().map(str::to_owned).collect())
+}
+
 /// The name and email commits are made with here, and whether they're set for this repository
 /// only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1180,6 +1313,23 @@ mod tests {
         assert_eq!(clone_dir_name("git@github.com:a/b.git"), "b");
         assert_eq!(clone_dir_name("C:\\repos\\thing\\"), "thing");
         assert_eq!(clone_dir_name("git@host:proj"), "proj");
+    }
+
+    #[test]
+    fn bodies_fit_on_one_line() {
+        assert_eq!(
+            one_line(
+                "First line
+second.
+
+- a
+- b
+"
+            ),
+            "First line second. - a - b"
+        );
+        assert_eq!(one_line(""), "");
+        assert_eq!(one_line(&"x ".repeat(500)).chars().count(), 400);
     }
 
     #[test]

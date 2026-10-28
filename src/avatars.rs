@@ -17,7 +17,8 @@ const RETRY_MISSING: Duration = Duration::from_secs(7 * 24 * 3600);
 #[derive(Clone)]
 enum State {
     Pending,
-    Ready(Arc<[u8]>),
+    /// The picture, and its cache key (which says where it came from).
+    Ready(Arc<[u8]>, String),
     Missing,
 }
 
@@ -159,7 +160,7 @@ fn fetch(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> State {
     let k = cache_key(email, hint);
     if let Some(dir) = &dir {
         if let Ok(bytes) = std::fs::read(dir.join(format!("{k}.img"))) {
-            return State::Ready(Arc::from(bytes.into_boxed_slice()));
+            return State::Ready(Arc::from(bytes.into_boxed_slice()), k);
         }
         let missing = dir.join(format!("{k}.none"));
         let recent = std::fs::metadata(&missing)
@@ -190,7 +191,7 @@ fn fetch(agent: &ureq::Agent, email: &str, hint: Option<&Hint>) -> State {
                 let _ = std::fs::create_dir_all(dir);
                 let _ = std::fs::write(dir.join(format!("{k}.img")), &bytes);
             }
-            State::Ready(Arc::from(bytes.into_boxed_slice()))
+            State::Ready(Arc::from(bytes.into_boxed_slice()), k)
         }
         _ => {
             if let Some(dir) = &dir {
@@ -221,10 +222,11 @@ pub fn paint(ui: &egui::Ui, rect: Rect, email: &str) -> bool {
             }
         }
     };
-    let State::Ready(bytes) = state else {
+    let State::Ready(bytes, source) = state else {
         return false;
     };
-    let uri = format!("bytes://avatar/{}.png", key(&k));
+    // egui keeps an image per URI: one per source, so a forge's picture replaces Gravatar's.
+    let uri = format!("bytes://avatar/{source}.png");
     egui::Image::from_bytes(uri, Bytes::Shared(bytes))
         .fit_to_exact_size(Vec2::splat(rect.width()))
         .corner_radius(rect.width() / 2.0)

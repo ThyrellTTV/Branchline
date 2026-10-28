@@ -136,6 +136,9 @@ impl Terminal {
         cmd.cwd(cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        if let Some(path) = crate::shell_path::path() {
+            cmd.env("PATH", path);
+        }
         let child = pair
             .slave
             .spawn_command(cmd)
