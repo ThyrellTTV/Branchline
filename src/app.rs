@@ -418,7 +418,7 @@ impl App {
                         .show(|ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "gitcraft {} is out (you have {}).",
+                                    "branchline {} is out (you have {}).",
                                     release.version,
                                     update::CURRENT
                                 ))
@@ -484,8 +484,9 @@ impl App {
                     ui.add_space((ui.available_height() * 0.10).max(32.0));
                     ui.horizontal(|ui| {
                         icons::inline(ui, "git-merge", 34.0, t.accent);
-                        ui.label(RichText::new("gitcraft").font(theme::semibold(30.0)));
+                        ui.label(RichText::new("Branchline").font(theme::semibold(30.0)));
                     });
+                    ui.hyperlink_to("Based on GitCraft by Iván", "https://github.com/Vancete/gitcraft");
                     ui.add_space(4.0);
                     if let Ok(v) = &self.git_version {
                         ui.horizontal(|ui| {
@@ -498,7 +499,7 @@ impl App {
                     {
                         ui.add_space(4.0);
                         let link = ui
-                            .link("Add gitcraft to the applications menu")
+                            .link("Add branchline to the applications menu")
                             .on_hover_text(appimage.display().to_string());
                         if link.clicked() {
                             self.error = crate::desktop_entry::install(&appimage).err();
@@ -782,7 +783,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new("Git was not found").font(theme::semibold(24.0)));
             ui.add_space(8.0);
-            ui.label("gitcraft uses the git command line. Install git and make sure `git` is on your PATH.");
+            ui.label("branchline uses the git command line. Install git and make sure `git` is on your PATH.");
             ui.add_space(4.0);
             ui.label(RichText::new(err).color(t.text_faint).small());
             ui.add_space(16.0);
@@ -958,7 +959,7 @@ impl eframe::App for App {
 
 /// The window and taskbar icon (the `.exe` gets the same picture from `build.rs`).
 pub fn window_icon() -> egui::IconData {
-    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/gitcraft-256.png"))
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/branchline-256.png"))
         .unwrap_or_default()
 }
 
@@ -1341,7 +1342,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Manual").font(theme::semibold(16.0)));
                     ui.label(
-                        RichText::new(format!("gitcraft {}", update::CURRENT)).color(t.text_faint),
+                        RichText::new(format!("Branchline {}", update::CURRENT)).color(t.text_faint),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::small_button(ui, "x", "Close (Esc)").clicked() {
@@ -1415,8 +1416,8 @@ fn notify(text: &str) {
     let text = text.to_owned();
     std::thread::spawn(move || {
         let _ = notify_rust::Notification::new()
-            .appname("gitcraft")
-            .summary("gitcraft")
+            .appname("branchline")
+            .summary("branchline")
             .body(&text)
             .show();
     });

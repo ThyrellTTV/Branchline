@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=gitcraft
+Name=branchline
 Comment=A small visual git client
-Exec=gitcraft %f
+Exec=branchline %f
 Terminal=false
 Categories=Development;RevisionControl;
-Icon=gitcraft
-StartupWMClass=gitcraft
+Icon=branchline
+StartupWMClass=branchline

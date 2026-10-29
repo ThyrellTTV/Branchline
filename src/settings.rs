@@ -65,7 +65,7 @@ impl Default for Settings {
 }
 
 fn id() -> egui::Id {
-    egui::Id::new("gitcraft-settings")
+    egui::Id::new("branchline-settings")
 }
 
 impl Settings {
@@ -120,7 +120,7 @@ impl Settings {
                     let note = match crate::vscode_theme::current() {
                         Some(found) if found.dark == t.dark() => found.name.clone(),
                         Some(found) => format!(
-                            "{} is {}: gitcraft's colours meanwhile",
+                            "{} is {}: branchline's colours meanwhile",
                             found.name,
                             if found.dark { "dark" } else { "light" }
                         ),
@@ -137,10 +137,10 @@ impl Settings {
                 ui.label("Applications menu");
                 ui.horizontal(|ui| {
                     if crate::desktop_entry::installed() {
-                        if ui.button("Remove gitcraft").clicked() {
+                        if ui.button("Remove branchline").clicked() {
                             let _ = crate::desktop_entry::uninstall();
                         }
-                    } else if ui.button("Add gitcraft").clicked() {
+                    } else if ui.button("Add branchline").clicked() {
                         let _ = crate::desktop_entry::install(&appimage);
                     }
                     ui.label(

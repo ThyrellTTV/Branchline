@@ -58,7 +58,7 @@ pub fn hint(email: &str, hint: Hint) {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    eframe::storage_dir("gitcraft").map(|d| d.join("avatars"))
+    eframe::storage_dir("branchline").map(|d| d.join("avatars"))
 }
 
 fn avatars(ctx: &egui::Context) -> &'static Avatars {
@@ -68,7 +68,7 @@ fn avatars(ctx: &egui::Context) -> &'static Avatars {
         std::thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(8))
-                .user_agent("gitcraft")
+                .user_agent("branchline")
                 .build();
             while let Ok(email) = rx.recv() {
                 let hint = lock(hints()).get(&email).cloned();

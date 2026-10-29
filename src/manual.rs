@@ -1,4 +1,4 @@
-//! The manual (F1, or the book in the title bar): what gitcraft does and its keyboard shortcuts.
+//! The manual (F1, or the book in the title bar): what branchline does and its keyboard shortcuts.
 
 use egui::{RichText, Ui};
 

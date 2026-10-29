@@ -1,200 +1,65 @@
-# gitcraft
+# Branchline
 
-A visual git client: a simplified take yet powerful on the usual graph-based git GUIs.
-Rust + [egui/eframe](https://github.com/emilk/egui), the same technical stack of the ArtCraft suite, so it builds on Windows, Linux and macOS and stays light and fast. It drives the installed `git` command line,
-so your config, credentials and hooks apply as usual.
+A lightweight Git desktop client for Windows with a visual commit graph, branch management, file diffs, and an integrated terminal.
 
-![gitcraft: branches, remotes and worktrees on the left, the graph with branch pills and relative dates, uncommitted changes on the right and the integrated terminal below](docs/screenshot.png)
+Based on **[GitCraft](https://github.com/Vancete/gitcraft)** by Iván. Branchline preserves its compact, dark, three-panel interface while establishing an independent app identity and development direction. See [UPSTREAM.md](UPSTREAM.md) for provenance and the changes in this derivative.
 
-## Features
+![Upstream GitCraft interface that Branchline is based on](docs/screenshot.png)
 
-**Repositories and tabs**
+*Upstream screenshot; Branchline's initial interface is inherited from this design.*
 
-- Start page: checks that `git` is installed; open, create (`git init`) or clone a repository;
-  recent repositories.
-- Browser-like tabs, one per repository (Ctrl+T, Ctrl+W, middle-click). Open tabs, recents,
-  theme and settings are remembered.
-- Changes made elsewhere (editor, terminal) show up by themselves: the folder is watched.
+## Status
 
-**Graph**
+Initial source version: **0.1.0**, based on GitCraft 0.3.0. The Git engine and interface are inherited from upstream. Branchline adds independent naming, application settings, release links, Windows packaging and upstream credit. Inherited features have not all been independently validated.
 
-- Every branch, coloured lanes, ↑/↓ to move. History loads 1500 commits at a time as you scroll.
-- Branch and tag pills in their own column left of the graph, on each branch's tip only, joined
-  to their commit: white text, a laptop icon when the branch is local, a cloud when a remote has
-  it at that commit (`x` and `origin/x` make one pill), a pull-request icon when one is open,
-  `+N` when more refs share the commit, the author's avatar and how long ago it was ("2 hours
-  ago"). Author, date and hash columns are optional (Settings).
-- The checked-out branch's pill is solid, the others a darker shade. Double-click a pill to
-  check that branch (or tag) out; hover `+N` to list every pill of the commit and double-click
-  the one you want.
-- Each commit's summary, followed by the rest of its message, faded and cut to fit.
-- An _Uncommitted changes_ row on top while the working tree is dirty.
-- Search (Ctrl+F) through messages, authors and hashes of all history, or switch to _Code_ to
-  find the commits that added or removed a piece of text in a file (`git log -S`); Enter /
-  Shift+Enter jump between results, loading older history when needed.
-- Right-click a commit: create a branch or a tag, check it out, interactive rebase onto it,
-  cherry-pick, revert, reset the current branch to it (soft / mixed / hard, confirmed), the menu
-  of each branch on it, copy the hash, message or branch name. Right-click a branch's pill to get
-  check out, fast-forward, merge, rebase and interactive rebase for that branch on top.
-- Compare: Ctrl+click a second commit (or _Compare with…_ in the commit menu, the changes row
-  standing for the working tree) to list the files that differ between the two and open each
-  diff. On a branch, _Changes x adds to main_ shows only what it changed since the two diverged,
-  as a pull request shows it, and _Compare main with x_ every difference; a checkbox switches
-  between the two. The right pane says how many commits each side has that the other hasn't.
-- Interactive rebase: the commits to rewrite, newest on top; pick, reword (edit the message in
-  place), squash, fix up or drop each one, move them up and down, then _Start rebase_. Ctrl+Z
-  undoes it.
+The [Windows build workflow](https://github.com/ThyrellTTV/Branchline/actions/workflows/windows.yml) runs the tests, compiles the app, and creates a portable ZIP. Check the run result before downloading its artifact. There is no published Branchline release yet.
 
-**Branches, remotes, worktrees, stashes, tags** (left)
+## Included capabilities
 
-- Local branches with ahead/behind; right-click: check out (or in a new worktree), fast-forward,
-  merge into / (interactively) rebase onto the current branch, push, create a pull request,
-  rename, delete…
-- Remotes: add, edit (name and URL), fetch one, remove; their branches below each.
-- Worktrees: add (existing or new branch), open in a tab, open a terminal there, lock, remove,
-  prune.
-- Stashes: stash (with a message, untracked files included), see what a stash holds, apply, pop,
-  drop.
-- Pull / merge requests of GitHub (through `gh`) or GitLab (through `glab`): list, open in the
-  browser, check out, create from a branch.
-- Tags: create (light or annotated, optionally pushed), push, delete locally or on the remote.
+- Open, initialize and clone repositories; multiple repository tabs.
+- Colored commit graph with branch/tag references and history search.
+- Local branches, remotes, worktrees, stashes and tags.
+- File and partial staging, commit/amend, unified and side-by-side diffs.
+- Merge/conflict tools, history, blame and advanced Git operations.
+- Integrated PowerShell and other installed shells.
+- Dark, gray and light themes, configurable zoom and keyboard shortcuts.
 
-**Changes and commits** (right)
+These capabilities come from upstream. The app uses the installed Git CLI, including its configured identities, credential helpers and hooks. GitHub/GitLab pull-request features additionally depend on `gh`/`glab` where used.
 
-- Conflicted / unstaged / staged lists with stage, unstage, discard and mark-resolved buttons,
-  _Stage all_ / _Unstage all_; right-click a file to open it, open it in your editor, show it in
-  its folder, see its history or blame, or ignore it (the file, its extension or its folder go
-  into `.gitignore`; a tracked file stops being tracked).
-- Part of a file: _Stage hunk_, _Discard hunk_ and _Unstage hunk_ on each hunk of its diff, or
-  click the changed lines you want (Shift+click for a range) and stage, unstage or discard only
-  those. Discarding can be undone with Ctrl+Z.
-- Commit box (Ctrl+Enter; with nothing staged it stages everything), _Amend last commit_
-  (warns when the commit is already pushed), the identity you commit as, and saved identities to
-  switch a repository to.
-- Undo / redo (Ctrl+Z / Ctrl+Y) of commits, amends, merges, rebases, pulls, resets,
-  cherry-picks, reverts, checkouts, branch create / rename / delete, tags and stashes.
+## Run on Windows
 
-**Diffs and conflicts** (centre)
+1. Install [Git for Windows](https://git-scm.com/download/win) and make sure `git --version` works.
+2. Open a successful Windows workflow run and download the `Branchline-windows-x64` artifact.
+3. Extract the artifact and the portable ZIP inside it, then run `branchline.exe`.
 
-- Unified or side by side, syntax colours, the changed part of each line marked, whitespace
-  changes optional, images shown before / after. Esc closes.
-- Code takes the colours of the theme VS Code (or Insiders, VSCodium) is using, read from its
-  settings and extensions, when it is dark or light like gitcraft's; a setting turns it off.
-- Conflicts open in a three-pane editor: each conflict's two sides with _Ours_, _Theirs_ and
-  _Both_ buttons, and the result below (editable). _Use mine_ / _Use theirs_ for a whole file.
-- A merge, rebase, cherry-pick or revert stopped on conflicts shows a banner with _Abort_; the
-  commit box finishes it (_Continue rebase_ during a rebase).
-- File history (every commit that changed the file, following renames; click one for its diff)
-  and blame (who last changed each line, newer changes marked brighter; click to go to the
-  commit).
+Keep the license and attribution files with the portable distribution. Start with a disposable repository when evaluating an early build.
 
-**Toolbar, terminal, app**
+You can also pass a repository path:
 
-- Undo, redo, Fetch, Pull and Push (with incoming / outgoing counts), new branch, stash, terminal,
-  search, open the folder (Explorer / Finder, your editor), refresh (F5).
-- Background fetch every few minutes (Settings; 0 turns it off).
-- HTTPS sign-in: when a remote wants a username and password (or token) and no credential helper
-  provides them, a dialog asks and the operation runs again. They stay in memory for the tab;
-  git's own credential helper, if there is one, stores them. Cloning asks the same way.
-- Terminal panel with tabs: PowerShell, cmd, Git Bash, WSL… on Windows, your shells elsewhere, in a
-  real pseudo-terminal (ConPTY on Windows) with colours, scrollback, mouse selection and copy
-  (Ctrl+C with a selection, Ctrl+Shift+C or right-click).
-- Command palette (Ctrl+P): every action and branch, fuzzy matched.
-- Manual (F1, or the book in the title bar): what each part does and every keyboard shortcut.
-- Avatars: on a GitHub repository, the authors' GitHub accounts (through `gh` when installed, else
-  GitHub's API); on GitLab, the host's avatar API; elsewhere Gravatar (a hash of the email).
-  Cached on disk; can be turned off.
-- Settings: zoom, branch column width, graph columns, avatars, notifications, update check,
-  background fetch, editor command, default shell and terminal font size, saved identities.
-- Checks GitHub once a day for a newer release and shows a pill to download it (can be turned
-  off).
-- Toasts, and a desktop notification when a long operation ends while the window is in the
-  background.
-- Themes: Dark, Medium Gray and Light, from PhotoCraft's Pro palettes.
-
-## Download
-
-Ready-made builds for Windows, Linux (x86-64) and macOS (Apple silicon and Intel) are on the
-[releases page](https://github.com/Vancete/gitcraft/releases). Git must be installed.
-
-- **Windows:** `gitcraft-…-setup.exe` installs it for your user (no administrator rights), with a
-  Start menu entry, an optional desktop icon, _Open in gitcraft_ on folders and an uninstaller.
-  The `.zip` is the same program without installing.
-- **Linux:** `gitcraft-….deb` (Debian, Ubuntu, Mint…) and `gitcraft-….rpm` (Fedora, openSUSE…)
-  install it with its applications menu entry, from the software centre or with
-  `sudo apt install ./gitcraft-….deb` / `sudo dnf install ./gitcraft-….rpm`.
-  `gitcraft-….AppImage` runs on any distribution: make it executable (`chmod +x`) and run it;
-  _Add gitcraft to the applications menu_ on its start page (or in Settings) adds a menu entry,
-  which follows the AppImage when you replace it with a newer one. The `.tar.gz` holds the bare
-  binary and a `.desktop` file.
-- **macOS** (11 or later): open `gitcraft-…-macos-universal.dmg` and drag gitcraft to
-  Applications; the `.zip` holds the same app. It isn't notarized by Apple, so the first time
-  macOS refuses to open it: go to _System Settings › Privacy & Security_ and click _Open
-  Anyway_, or run `xattr -dr com.apple.quarantine /Applications/gitcraft.app`. git comes with
-  the Xcode command line tools (`xcode-select --install`) or Homebrew.
-
-A release is built by `.github/workflows/release.yml` whenever a `v*` tag is pushed
-(`packaging/windows/gitcraft.iss` for the installer, `packaging/linux/build-appimage.sh` for the
-AppImage, `[package.metadata.deb]` / `[package.metadata.generate-rpm]` in `Cargo.toml` for the
-packages, `packaging/macos/build-app.sh` for the universal app, its `.dmg` and `.zip`).
-
-## Build and run
-
-```bash
-cargo run --release                   # start
-cargo run --release -- path/to/repo   # open a repository directly
-cargo test
+```powershell
+.\branchline.exe "C:\path\to\repository"
 ```
 
-Linux needs the usual eframe system packages (e.g. `libxkbcommon-dev`, `libgtk-3-dev` for the
-file dialogs, `libdbus-1-dev` for notifications). Pull requests need the GitHub CLI (`gh`) or
-GitLab CLI (`glab`), logged in.
+## Build from source
 
-### Looking at the UI headlessly
+Requirements: Git, Rust **1.95 or newer**, and the Microsoft C++ build tools with a Windows SDK. Use the MSVC Rust toolchain on Windows.
 
-`examples/ui_shot.rs` drives the app without a window (egui_kittest) and saves PNGs:
-
-```bash
-cargo run --example ui_shot -- path/to/repo /tmp/shot click:500,266 shot key:Escape shot
+```powershell
+git clone git@github.com:ThyrellTTV/Branchline.git
+cd Branchline
+cargo test --release --locked
+cargo build --release --locked
+.\target\release\branchline.exe
 ```
 
-Steps: `click:x,y`, `dclick:x,y`, `rclick:x,y`, `cclick:x,y` (with Ctrl / Cmd), `sclick:x,y`
-(with Shift), `drag:x1,y1,x2,y2`, `hover:x,y`, `wheel:x,y,dy` (negative scrolls down), `leave`,
-`key:Name`, `ckey:Name` (with Ctrl / Cmd), `type:text`, `wait:ms`, `shot`. The README screenshot
-was made this way, on a demo repository.
+Branchline stores its UI state separately from GitCraft. The inherited macOS/Linux packaging sources remain available, but current CI validates Windows only.
 
-## Layout
+## Development
 
-| File                     | Job                                                                                |
-| ------------------------ | ---------------------------------------------------------------------------------- |
-| `src/git.rs`             | `git` CLI wrapper and output parsing (refs, log, status, stashes, remotes, search) |
-| `src/graph.rs`           | lane layout for the commit graph                                                   |
-| `src/forge.rs`           | pull / merge requests through `gh` and `glab`                                      |
-| `src/avatars.rs`         | avatars from GitHub, GitLab or Gravatar, cached on disk                            |
-| `src/update.rs`          | new-release check                                                                  |
-| `src/desktop_entry.rs`   | applications menu entry for the AppImage                                           |
-| `src/shell_path.rs`      | on macOS, the login shell's PATH for the commands gitcraft starts                  |
-| `src/settings.rs`        | user settings and their form                                                       |
-| `src/manual.rs`          | the manual (F1): features and keyboard shortcuts                                   |
-| `src/theme.rs`           | colour tokens, fonts, egui style (PhotoCraft's Pro themes)                         |
-| `src/icons.rs`           | embedded Lucide SVG icons, tinted                                                  |
-| `src/terminal.rs`        | integrated terminal: pty, VT parsing (`vt100`), painting, keys, selection          |
-| `src/repo/mod.rs`        | one repository tab: state, background git work, undo / redo, toolbar               |
-| `src/repo/sidebar.rs`    | branches, remotes, worktrees, stashes, pull requests, tags                         |
-| `src/repo/graph_view.rs` | commit graph, pills, search bar, commit menu                                       |
-| `src/repo/detail.rs`     | commit / stash detail, changes and commit box                                      |
-| `src/repo/diff.rs`       | diff loading, pairing and the diff view (unified, split, images)                   |
-| `src/repo/highlight.rs`  | syntax colours (syntect)                                                           |
-| `src/vscode_theme.rs`    | VS Code's current colour theme as a syntect theme                                  |
-| `src/repo/conflict.rs`   | three-pane conflict editor                                                         |
-| `src/repo/rebase.rs`     | interactive rebase editor and its todo list                                        |
-| `src/repo/file_view.rs`  | a file's history and blame                                                         |
-| `src/repo/dialogs.rs`    | branch, tag, stash, remote, worktree, pull request and confirm dialogs             |
-| `src/repo/widgets.rs`    | shared painted widgets (panel headers, file rows, avatars, tabs)                   |
-| `src/app.rs`             | window shell: tabs, start page, cloning, palette, settings, toasts                 |
+See [ROADMAP.md](ROADMAP.md). Keep changes focused, add regression tests for behavioral changes, and run tests before submitting a pull request. The original commit history is retained so upstream fixes can be reviewed and merged.
 
-Assets and their licences: [ATTRIBUTION.md](ATTRIBUTION.md).
+## License and credits
 
-## License
+Source: **MIT OR Apache-2.0**, inherited from GitCraft. Original copyright notices remain in [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
-MIT OR Apache-2.0, at your option ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
+Fonts and icons retain their respective licenses; see [ATTRIBUTION.md](ATTRIBUTION.md). The initial app icon is inherited from GitCraft. Branchline is an independent derivative and does not imply endorsement by the upstream author.

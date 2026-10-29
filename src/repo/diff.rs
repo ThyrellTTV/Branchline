@@ -1276,7 +1276,7 @@ mod tests {
     /// Stages, unstages and discards a few lines in a real repository.
     #[test]
     fn partial_patches_apply_with_git() {
-        let dir = std::env::temp_dir().join(format!("gitcraft-partial-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("branchline-partial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let git = |args: &[&str]| git::run(Some(&dir), args);

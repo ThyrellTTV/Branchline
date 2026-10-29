@@ -261,7 +261,7 @@ impl RepoTab {
             .corner_radius(t.radius_lg)
             .inner_margin(egui::Margin::same(18))
             .shadow(ctx.global_style().visuals.window_shadow);
-        let modal = egui::Modal::new(egui::Id::new("gitcraft-dialog"))
+        let modal = egui::Modal::new(egui::Id::new("branchline-dialog"))
             .frame(frame)
             .backdrop_color(egui::Color32::from_black_alpha(110));
 

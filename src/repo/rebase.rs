@@ -123,7 +123,7 @@ impl RebaseEditor {
     /// git command that runs the rebase with them.
     pub fn command(&self) -> Result<Vec<String>, String> {
         let dir = std::env::temp_dir().join(format!(
-            "gitcraft-rebase-{}-{}",
+            "branchline-rebase-{}-{}",
             std::process::id(),
             crate::git::now()
         ));

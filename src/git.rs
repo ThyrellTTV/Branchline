@@ -1,5 +1,5 @@
 //! Thin wrapper over the `git` command line. Every call shells out to the installed git, so
-//! gitcraft behaves exactly like the user's own git (config, credentials, hooks).
+//! branchline behaves exactly like the user's own git (config, credentials, hooks).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,7 +57,7 @@ pub fn run_ok_codes(dir: Option<&Path>, args: &[&str], ok: &[i32]) -> Result<Str
     run_inner(dir, args, ok, None)
 }
 
-/// A username and password (or token) for an HTTPS remote, typed into gitcraft.
+/// A username and password (or token) for an HTTPS remote, typed into branchline.
 #[derive(Clone)]
 pub struct Credentials {
     pub username: String,
@@ -558,7 +558,7 @@ pub fn count_apart(repo: &Path, a: &str, b: &str) -> Result<(u32, u32), String> 
 pub fn save_patch(patch: &str) -> Result<PathBuf, String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join("gitcraft-patches");
+    let dir = std::env::temp_dir().join("branchline-patches");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {

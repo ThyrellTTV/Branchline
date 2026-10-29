@@ -1,12 +1,12 @@
 [package]
-name = "gitcraft"
-version = "0.3.0"
+name = "branchline"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
-description = "A small, personal visual git client"
+description = "A lightweight visual Git desktop client based on GitCraft"
 publish = false
-repository = "https://github.com/Vancete/gitcraft"
+repository = "https://github.com/ThyrellTTV/Branchline"
 readme = "README.md"
 
 [dependencies]
@@ -48,27 +48,27 @@ section = "devel"
 depends = "$auto, git"
 extended-description = "A visual git client: commit graph with branch pills, diffs, blame, stashes, interactive rebase, conflicts and a built-in terminal. Drives the installed git command line."
 assets = [
-    ["target/release/gitcraft", "usr/bin/", "755"],
-    ["packaging/gitcraft.desktop", "usr/share/applications/", "644"],
-    ["assets/app-icon/gitcraft-256.png", "usr/share/icons/hicolor/256x256/apps/gitcraft.png", "644"],
-    ["README.md", "usr/share/doc/gitcraft/", "644"],
+    ["target/release/branchline", "usr/bin/", "755"],
+    ["packaging/branchline.desktop", "usr/share/applications/", "644"],
+    ["assets/app-icon/branchline-256.png", "usr/share/icons/hicolor/256x256/apps/branchline.png", "644"],
+    ["README.md", "usr/share/doc/branchline/", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/gitcraft", dest = "/usr/bin/gitcraft", mode = "755" },
-    { source = "packaging/gitcraft.desktop", dest = "/usr/share/applications/gitcraft.desktop", mode = "644" },
-    { source = "assets/app-icon/gitcraft-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/gitcraft.png", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/gitcraft/README.md", mode = "644", doc = true },
-    { source = "LICENSE-MIT", dest = "/usr/share/licenses/gitcraft/LICENSE-MIT", mode = "644", doc = true },
-    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/gitcraft/LICENSE-APACHE", mode = "644", doc = true },
+    { source = "target/release/branchline", dest = "/usr/bin/branchline", mode = "755" },
+    { source = "packaging/branchline.desktop", dest = "/usr/share/applications/branchline.desktop", mode = "644" },
+    { source = "assets/app-icon/branchline-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/branchline.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/branchline/README.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/licenses/branchline/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/licenses/branchline/LICENSE-APACHE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]
 git = "*"
 
 [build-dependencies]
-# Icon and version info for gitcraft.exe; build.rs only uses it when targeting Windows.
+# Icon and version info for branchline.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
 
 [dev-dependencies]

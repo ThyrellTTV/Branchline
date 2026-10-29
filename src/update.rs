@@ -1,4 +1,4 @@
-//! Asks GitHub whether a newer gitcraft release exists (at most once a day, can be turned off).
+//! Asks GitHub whether a newer branchline release exists (at most once a day, can be turned off).
 
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// Redirects to the latest release's page, `…/releases/tag/vX.Y.Z`. The web page rather than
 /// the REST API: the API allows 60 anonymous requests an hour per IP, which shared addresses
 /// (VPNs, offices) use up.
-const LATEST: &str = "https://github.com/Vancete/gitcraft/releases/latest";
+const LATEST: &str = "https://github.com/ThyrellTTV/Branchline/releases/latest";
 /// Seconds between two checks.
 pub const INTERVAL: i64 = 24 * 3600;
 
@@ -22,7 +22,7 @@ pub struct Release {
 pub fn latest() -> Result<Release, String> {
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
-        .user_agent("gitcraft")
+        .user_agent("branchline")
         .build()
         .head(LATEST)
         .call()
@@ -73,15 +73,15 @@ mod tests {
     #[test]
     fn release_page_urls() {
         assert_eq!(
-            release_from_url("https://github.com/Vancete/gitcraft/releases/tag/v0.2.0"),
+            release_from_url("https://github.com/ThyrellTTV/Branchline/releases/tag/v0.2.0"),
             Some(Release {
                 version: "0.2.0".into(),
-                url: "https://github.com/Vancete/gitcraft/releases/tag/v0.2.0".into()
+                url: "https://github.com/ThyrellTTV/Branchline/releases/tag/v0.2.0".into()
             })
         );
         // No release yet: the redirect lands on the list.
         assert_eq!(
-            release_from_url("https://github.com/Vancete/gitcraft/releases"),
+            release_from_url("https://github.com/ThyrellTTV/Branchline/releases"),
             None
         );
     }

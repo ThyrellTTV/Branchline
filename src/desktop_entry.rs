@@ -3,11 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// File name of the entry, apart from the `gitcraft.desktop` a package installs.
-const ENTRY: &str = "gitcraft-appimage.desktop";
-const ICON: &[u8] = include_bytes!("../assets/app-icon/gitcraft-256.png");
+/// File name of the entry, apart from the `branchline.desktop` a package installs.
+const ENTRY: &str = "branchline-appimage.desktop";
+const ICON: &[u8] = include_bytes!("../assets/app-icon/branchline-256.png");
 
-/// The AppImage file gitcraft runs from (its runtime sets `APPIMAGE`), on Linux.
+/// The AppImage file branchline runs from (its runtime sets `APPIMAGE`), on Linux.
 pub fn appimage() -> Option<PathBuf> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -29,7 +29,7 @@ fn entry_path(data: &Path) -> PathBuf {
 }
 
 fn icon_path(data: &Path) -> PathBuf {
-    data.join("icons/hicolor/256x256/apps/gitcraft.png")
+    data.join("icons/hicolor/256x256/apps/branchline.png")
 }
 
 /// Whether the menu entry exists.
@@ -89,14 +89,14 @@ fn entry(appimage: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=gitcraft\n\
+         Name=branchline\n\
          Comment=A small visual git client\n\
          Exec={exec} %f\n\
          TryExec={}\n\
          Terminal=false\n\
          Categories=Development;RevisionControl;\n\
-         Icon=gitcraft\n\
-         StartupWMClass=gitcraft\n",
+         Icon=branchline\n\
+         StartupWMClass=branchline\n",
         escape_value(&appimage.to_string_lossy())
     )
 }
@@ -130,8 +130,8 @@ mod tests {
     #[test]
     fn quotes_the_appimage_path() {
         assert_eq!(
-            quote_exec("/home/me/Apps/gitcraft.AppImage"),
-            "\"/home/me/Apps/gitcraft.AppImage\""
+            quote_exec("/home/me/Apps/branchline.AppImage"),
+            "\"/home/me/Apps/branchline.AppImage\""
         );
         assert_eq!(
             quote_exec("/home/me/My Apps/$x 100%/a\"b"),
@@ -141,8 +141,8 @@ mod tests {
 
     #[test]
     fn writes_and_refreshes_the_entry() {
-        let data = std::env::temp_dir().join(format!("gitcraft-desktop-{}", std::process::id()));
-        let old = Path::new("/opt/gitcraft-v0.2.0.AppImage");
+        let data = std::env::temp_dir().join(format!("branchline-desktop-{}", std::process::id()));
+        let old = Path::new("/opt/branchline-v0.2.0.AppImage");
         let ok = write_entry(&data, old).is_ok();
         let text = std::fs::read_to_string(entry_path(&data)).unwrap_or_default();
         let icon = std::fs::metadata(icon_path(&data))
@@ -150,9 +150,9 @@ mod tests {
             .unwrap_or(0);
         let _ = std::fs::remove_dir_all(&data);
         assert!(ok);
-        assert!(text.contains("Exec=\"/opt/gitcraft-v0.2.0.AppImage\" %f\n"));
-        assert!(text.contains("TryExec=/opt/gitcraft-v0.2.0.AppImage\n"));
+        assert!(text.contains("Exec=\"/opt/branchline-v0.2.0.AppImage\" %f\n"));
+        assert!(text.contains("TryExec=/opt/branchline-v0.2.0.AppImage\n"));
         assert_eq!(icon, ICON.len() as u64);
-        assert_ne!(text, entry(Path::new("/opt/gitcraft-v0.2.1.AppImage")));
+        assert_ne!(text, entry(Path::new("/opt/branchline-v0.2.1.AppImage")));
     }
 }

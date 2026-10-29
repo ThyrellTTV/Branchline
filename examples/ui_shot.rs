@@ -1,4 +1,4 @@
-//! Headless screenshots of gitcraft driven by a small script, for checking the UI without a
+//! Headless screenshots of branchline driven by a small script, for checking the UI without a
 //! window (and without touching the real mouse).
 //!
 //! `cargo run --example ui_shot -- <repo> <out-prefix> [step]...`
@@ -26,7 +26,7 @@ fn main() {
         .with_size([1400.0, 860.0])
         // A frame's worth of time per step, so two clicks make a double-click.
         .with_step_dt(1.0 / 60.0)
-        .build_eframe(|cc| gitcraft::app::App::new(cc, Some(repo.into())));
+        .build_eframe(|cc| branchline::app::App::new(cc, Some(repo.into())));
     settle(&mut harness, 1500);
 
     let mut shots = 0;
@@ -175,7 +175,7 @@ fn main() {
 }
 
 /// Steps frames for `ms` of real time, so background git work can land.
-fn settle(harness: &mut Harness<'_, gitcraft::app::App>, ms: u64) {
+fn settle(harness: &mut Harness<'_, branchline::app::App>, ms: u64) {
     let end = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < end {
         harness.step();

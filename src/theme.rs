@@ -188,7 +188,7 @@ impl Tokens {
 }
 
 fn tokens_id() -> egui::Id {
-    egui::Id::new("gitcraft-theme")
+    egui::Id::new("branchline-theme")
 }
 
 pub fn semibold(size: f32) -> FontId {

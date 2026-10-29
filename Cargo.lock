@@ -517,6 +517,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "branchline"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui_extras",
+ "egui_kittest",
+ "image",
+ "md5",
+ "notify",
+ "notify-rust",
+ "open",
+ "portable-pty",
+ "rfd",
+ "serde",
+ "serde_json",
+ "syntect",
+ "ureq",
+ "vt100",
+ "winresource",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1443,29 +1466,6 @@ checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
 dependencies = [
  "color_quant",
  "weezl",
-]
-
-[[package]]
-name = "gitcraft"
-version = "0.3.0"
-dependencies = [
- "eframe",
- "egui",
- "egui_extras",
- "egui_kittest",
- "image",
- "md5",
- "notify",
- "notify-rust",
- "open",
- "portable-pty",
- "rfd",
- "serde",
- "serde_json",
- "syntect",
- "ureq",
- "vt100",
- "winresource",
 ]
 
 [[package]]

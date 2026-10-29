@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>gitcraft</string>
+	<string>branchline</string>
 	<key>CFBundleDisplayName</key>
-	<string>gitcraft</string>
+	<string>branchline</string>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.vancete.gitcraft</string>
+	<string>io.github.thyrellttv.branchline</string>
 	<key>CFBundleExecutable</key>
-	<string>gitcraft</string>
+	<string>branchline</string>
 	<key>CFBundleIconFile</key>
-	<string>gitcraft</string>
+	<string>branchline</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

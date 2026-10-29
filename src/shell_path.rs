@@ -1,6 +1,6 @@
 //! macOS apps opened from the Finder or the Dock get a bare PATH (`/usr/bin:/bin:/usr/sbin:/sbin`),
 //! without Homebrew's folders, where git, gh, glab and editors' commands usually are. The
-//! commands gitcraft starts get the PATH of the user's login shell instead.
+//! commands branchline starts get the PATH of the user's login shell instead.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// Folders added in any case (Homebrew on Apple silicon, then on Intel).
 const FALLBACK: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 
-/// The PATH for commands gitcraft runs, when it differs from its own (macOS only).
+/// The PATH for commands branchline runs, when it differs from its own (macOS only).
 pub fn path() -> Option<&'static OsString> {
     static PATH: OnceLock<Option<OsString>> = OnceLock::new();
     PATH.get_or_init(|| {

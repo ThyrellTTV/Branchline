@@ -1,6 +1,8 @@
 # Attribution
 
-Every asset bundled with gitcraft, its author, source and licence.
+Branchline inherits its initial interface and assets from [GitCraft](https://github.com/Vancete/gitcraft) by Iván. The original source copyright and license notices are preserved in LICENSE-MIT and LICENSE-APACHE. The application icon is inherited from GitCraft and renamed for this derivative.
+
+Original upstream asset attributions follow.
 
 | Files | What | Author | Source | Licence |
 |---|---|---|---|---|

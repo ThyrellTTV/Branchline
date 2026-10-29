@@ -1,0 +1,49 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main, master, 'codex/**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package portable app
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $PWD 'dist/Branchline-windows-x64'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item target/release/branchline.exe, README.md, UPSTREAM.md, ATTRIBUTION.md, LICENSE-MIT, LICENSE-APACHE $packageDir
+          New-Item -ItemType Directory -Path "$packageDir/assets/fonts" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$packageDir/assets/icons" -Force | Out-Null
+          Copy-Item assets/fonts/OFL-*.txt "$packageDir/assets/fonts"
+          Copy-Item assets/icons/LICENSE-lucide.txt "$packageDir/assets/icons"
+          Get-FileHash "$packageDir/branchline.exe" -Algorithm SHA256 | Format-List | Out-File "$packageDir/SHA256.txt"
+          Compress-Archive -Path $packageDir -DestinationPath dist/Branchline-windows-x64.zip
+
+      - name: Upload portable app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Branchline-windows-x64
+          path: dist/Branchline-windows-x64.zip
+          if-no-files-found: error

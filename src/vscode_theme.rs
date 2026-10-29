@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn reads_an_extension_theme_with_include() {
-        let dir = std::env::temp_dir().join(format!("gitcraft-vstheme-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("branchline-vstheme-{}", std::process::id()));
         let ext = dir.join("someone.nice-theme-1.0.0");
         let _ = std::fs::create_dir_all(ext.join("themes"));
         let write = |p: &str, s: &str| {
